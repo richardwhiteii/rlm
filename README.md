@@ -190,7 +190,7 @@ rlm_get_results(name="topics")
 
 ### Processing a 2MB Document
 
-Tested with H.R.1 "One Big Beautiful Bill Act" (2MB XML):
+Tested with H.R.1 Bill (2MB):
 
 ```
 # Load
