@@ -186,6 +186,109 @@ def _chunk_content(content: str, strategy: str, size: int) -> list[str]:
     return []
 
 
+def _detect_content_type(content: str) -> dict:
+    """Detect content type from first 1000 chars. Returns type and confidence."""
+    sample = content[:1000]
+
+    # Python detection
+    python_patterns = ["import ", "def ", "class ", "if __name__"]
+    python_score = sum(1 for p in python_patterns if p in sample)
+
+    # JSON detection
+    json_score = 0
+    stripped = sample.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            json.loads(content[:10000])  # Try parsing first 10K
+            json_score = 10
+        except json.JSONDecodeError:
+            json_score = 3 if stripped.startswith(("{", "[")) else 0
+
+    # Markdown detection
+    md_patterns = ["# ", "## ", "**", "```"]
+    md_score = sum(1 for p in md_patterns if p in sample)
+
+    # Log detection
+    log_patterns = ["ERROR", "INFO", "DEBUG", "WARN"]
+    log_score = sum(1 for p in log_patterns if p in sample)
+    if re.search(r"\d{4}-\d{2}-\d{2}", sample):  # Date pattern
+        log_score += 2
+
+    # Generic code detection
+    code_indicators = ["{", "}", ";", "=>", "->"]
+    code_score = sum(sample.count(c) for c in code_indicators) / 10
+
+    # Prose detection
+    sentence_count = len(re.findall(r"[.!?]\s+[A-Z]", sample))
+    prose_score = sentence_count
+
+    scores = {
+        "python": python_score,
+        "json": json_score,
+        "markdown": md_score,
+        "logs": log_score,
+        "code": code_score,
+        "prose": prose_score,
+    }
+
+    detected_type = max(scores, key=scores.get)
+    max_score = scores[detected_type]
+    confidence = min(1.0, max_score / 10.0) if max_score > 0 else 0.5
+
+    return {"type": detected_type, "confidence": round(confidence, 2)}
+
+
+def _select_chunking_strategy(content_type: str) -> dict:
+    """Select chunking strategy based on content type."""
+    strategies = {
+        "python": {"strategy": "lines", "size": 150},
+        "code": {"strategy": "lines", "size": 150},
+        "json": {"strategy": "chars", "size": 10000},
+        "markdown": {"strategy": "paragraphs", "size": 20},
+        "logs": {"strategy": "lines", "size": 500},
+        "prose": {"strategy": "paragraphs", "size": 30},
+    }
+    return strategies.get(content_type, {"strategy": "lines", "size": 100})
+
+
+def _adapt_query_for_goal(goal: str, content_type: str) -> str:
+    """Generate appropriate sub-query based on goal and content type."""
+    if goal.startswith("answer:"):
+        return goal[7:].strip()
+
+    goal_templates = {
+        "find_bugs": {
+            "python": "Identify bugs, issues, or potential errors in this Python code. Look for: syntax errors, logic errors, unhandled exceptions, type mismatches, missing imports.",
+            "code": "Identify bugs, issues, or potential errors in this code. Look for: syntax errors, logic errors, unhandled exceptions.",
+            "default": "Identify any errors, issues, or problems in this content.",
+        },
+        "summarize": {
+            "python": "Summarize what this Python code does. List main functions/classes and their purpose.",
+            "code": "Summarize what this code does. List main functions and their purpose.",
+            "markdown": "Summarize the main points of this documentation in 2-3 sentences.",
+            "prose": "Summarize the main points of this text in 2-3 sentences.",
+            "logs": "Summarize the key events and errors in these logs.",
+            "json": "Summarize the structure and key data in this JSON.",
+            "default": "Summarize the main points of this content in 2-3 sentences.",
+        },
+        "extract_structure": {
+            "python": "Extract the code structure: list all classes, functions, and their signatures.",
+            "code": "Extract the code structure: list all functions/classes and their signatures.",
+            "json": "Extract the JSON schema: list top-level keys and their types.",
+            "markdown": "Extract the document structure: list all headings and hierarchy.",
+            "default": "Extract the main structural elements of this content.",
+        },
+        "security_audit": {
+            "python": "Find security vulnerabilities: SQL injection, command injection, eval(), exec(), unsafe deserialization, hardcoded secrets, path traversal.",
+            "code": "Find security vulnerabilities: injection flaws, unsafe functions, hardcoded credentials.",
+            "default": "Identify potential security issues or sensitive information.",
+        },
+    }
+
+    templates = goal_templates.get(goal, {})
+    return templates.get(content_type, templates.get("default", f"Analyze this content for: {goal}"))
+
+
 # Tool definitions
 TOOL_DEFINITIONS = [
     Tool(
@@ -354,6 +457,33 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["query", "context_name", "chunk_indices"],
+        },
+    ),
+    Tool(
+        name="rlm_auto_analyze",
+        description="Automatically detect content type and analyze with optimal chunking strategy. One-step analysis for common tasks.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Context identifier"},
+                "content": {"type": "string", "description": "The content to analyze"},
+                "goal": {
+                    "type": "string",
+                    "description": "Analysis goal: 'summarize', 'find_bugs', 'extract_structure', 'security_audit', or 'answer:<your question>'",
+                },
+                "provider": {
+                    "type": "string",
+                    "enum": ["ollama", "claude-sdk"],
+                    "description": "LLM provider for sub-calls",
+                    "default": "claude-sdk",
+                },
+                "concurrency": {
+                    "type": "integer",
+                    "description": "Max parallel requests (default 4, max 8)",
+                    "default": 4,
+                },
+            },
+            "required": ["name", "content", "goal"],
         },
     ),
 ]
@@ -676,6 +806,72 @@ async def _handle_sub_query_batch(arguments: dict) -> list[TextContent]:
     })
 
 
+async def _handle_auto_analyze(arguments: dict) -> list[TextContent]:
+    """Automatically detect content type and analyze with optimal strategy."""
+    ctx_name = arguments["name"]
+    content = arguments["content"]
+    goal = arguments["goal"]
+    provider = arguments.get("provider", "claude-sdk")
+    concurrency = min(arguments.get("concurrency", 4), 8)
+
+    # Load the content
+    await _handle_load_context({"name": ctx_name, "content": content})
+
+    # Detect content type
+    detection = _detect_content_type(content)
+    detected_type = detection["type"]
+    confidence = detection["confidence"]
+
+    # Select chunking strategy
+    strategy_config = _select_chunking_strategy(detected_type)
+
+    # Chunk the content
+    chunk_result = await _handle_chunk_context({
+        "name": ctx_name,
+        "strategy": strategy_config["strategy"],
+        "size": strategy_config["size"],
+    })
+    chunk_data = json.loads(chunk_result[0].text)
+    chunk_count = chunk_data["chunk_count"]
+
+    # Sample if too many chunks (max 20)
+    chunk_indices = list(range(chunk_count))
+    sampled = False
+    if chunk_count > 20:
+        step = max(1, chunk_count // 20)
+        chunk_indices = list(range(0, chunk_count, step))[:20]
+        sampled = True
+
+    # Adapt query for goal and content type
+    adapted_query = _adapt_query_for_goal(goal, detected_type)
+
+    # Run batch query
+    batch_result = await _handle_sub_query_batch({
+        "query": adapted_query,
+        "context_name": ctx_name,
+        "chunk_indices": chunk_indices,
+        "provider": provider,
+        "concurrency": concurrency,
+    })
+    batch_data = json.loads(batch_result[0].text)
+
+    return _text_response({
+        "status": "completed",
+        "detected_type": detected_type,
+        "confidence": confidence,
+        "strategy": strategy_config,
+        "chunk_count": chunk_count,
+        "chunks_analyzed": len(chunk_indices),
+        "sampled": sampled,
+        "goal": goal,
+        "adapted_query": adapted_query,
+        "provider": provider,
+        "successful": batch_data["successful"],
+        "failed": batch_data["failed"],
+        "results": batch_data["results"],
+    })
+
+
 # Tool dispatch table
 TOOL_HANDLERS = {
     "rlm_load_context": _handle_load_context,
@@ -688,6 +884,7 @@ TOOL_HANDLERS = {
     "rlm_get_results": _handle_get_results,
     "rlm_list_contexts": _handle_list_contexts,
     "rlm_sub_query_batch": _handle_sub_query_batch,
+    "rlm_auto_analyze": _handle_auto_analyze,
 }
 
 
