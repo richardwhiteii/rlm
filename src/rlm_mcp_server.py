@@ -11,6 +11,9 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -102,6 +105,32 @@ def _text_response(data: Any) -> list[TextContent]:
 def _error_response(code: str, message: str) -> list[TextContent]:
     """Create a structured error response."""
     return _text_response({"error": code, "message": message})
+
+
+def _context_summary(name: str, content: str, **extra: Any) -> dict:
+    """Build a common context summary dict."""
+    summary = {
+        "name": name,
+        "length": len(content),
+        "lines": content.count("\n") + 1,
+    }
+    summary.update(extra)
+    return summary
+
+
+# Shared schema fragments for tool definitions
+PROVIDER_SCHEMA = {
+    "type": "string",
+    "enum": ["ollama", "claude-sdk"],
+    "description": "LLM provider for sub-call",
+    "default": "ollama",
+}
+
+PROVIDER_SCHEMA_CLAUDE_DEFAULT = {
+    **PROVIDER_SCHEMA,
+    "description": "LLM provider for sub-calls",
+    "default": "claude-sdk",
+}
 
 
 async def _call_ollama(query: str, context_content: str, model: str) -> tuple[Optional[str], Optional[str]]:
@@ -381,12 +410,7 @@ TOOL_DEFINITIONS = [
                 "query": {"type": "string", "description": "Question/instruction for the sub-call"},
                 "context_name": {"type": "string", "description": "Context identifier to query against"},
                 "chunk_index": {"type": "integer", "description": "Optional: specific chunk index"},
-                "provider": {
-                    "type": "string",
-                    "enum": ["ollama", "claude-sdk"],
-                    "description": "LLM provider for sub-call",
-                    "default": "ollama",
-                },
+                "provider": PROVIDER_SCHEMA,
                 "model": {
                     "type": "string",
                     "description": "Model to use (provider-specific defaults apply)",
@@ -440,12 +464,7 @@ TOOL_DEFINITIONS = [
                     "items": {"type": "integer"},
                     "description": "List of chunk indices to process",
                 },
-                "provider": {
-                    "type": "string",
-                    "enum": ["ollama", "claude-sdk"],
-                    "description": "LLM provider for sub-call",
-                    "default": "ollama",
-                },
+                "provider": PROVIDER_SCHEMA,
                 "model": {
                     "type": "string",
                     "description": "Model to use (provider-specific defaults apply)",
@@ -471,12 +490,7 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Analysis goal: 'summarize', 'find_bugs', 'extract_structure', 'security_audit', or 'answer:<your question>'",
                 },
-                "provider": {
-                    "type": "string",
-                    "enum": ["ollama", "claude-sdk"],
-                    "description": "LLM provider for sub-calls",
-                    "default": "claude-sdk",
-                },
+                "provider": PROVIDER_SCHEMA_CLAUDE_DEFAULT,
                 "concurrency": {
                     "type": "integer",
                     "description": "Max parallel requests (default 4, max 8)",
@@ -484,6 +498,29 @@ TOOL_DEFINITIONS = [
                 },
             },
             "required": ["name", "content", "goal"],
+        },
+    ),
+    Tool(
+        name="rlm_exec",
+        description="Execute Python code against a loaded context in a sandboxed subprocess. Set result variable for output.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute. User sets result variable for output.",
+                },
+                "context_name": {
+                    "type": "string",
+                    "description": "Name of previously loaded context",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max execution time in seconds (default 30)",
+                    "default": 30,
+                },
+            },
+            "required": ["code", "context_name"],
         },
     ),
 ]
@@ -501,13 +538,8 @@ async def _handle_load_context(arguments: dict) -> list[TextContent]:
     ctx_name = arguments["name"]
     content = arguments["content"]
 
-    meta = {
-        "name": ctx_name,
-        "length": len(content),
-        "lines": content.count("\n") + 1,
-        "hash": _hash_content(content),
-        "chunks": None,
-    }
+    content_hash = _hash_content(content)
+    meta = _context_summary(ctx_name, content, hash=content_hash, chunks=None)
     contexts[ctx_name] = {"meta": meta, "content": content}
     _save_context_to_disk(ctx_name, content, meta)
 
@@ -516,7 +548,7 @@ async def _handle_load_context(arguments: dict) -> list[TextContent]:
         "name": ctx_name,
         "length": meta["length"],
         "lines": meta["lines"],
-        "hash": meta["hash"],
+        "hash": content_hash,
     })
 
 
@@ -527,20 +559,20 @@ async def _handle_inspect_context(arguments: dict) -> list[TextContent]:
 
     error = _ensure_context_loaded(ctx_name)
     if error:
-        return _text_response(error)
+        return _error_response("context_not_found", error)
 
     ctx = contexts[ctx_name]
     content = ctx["content"]
     chunk_meta = ctx["meta"].get("chunks")
 
-    return _text_response({
-        "name": ctx_name,
-        "length": len(content),
-        "lines": content.count("\n") + 1,
-        "preview": content[:preview_chars],
-        "has_chunks": chunk_meta is not None,
-        "chunk_count": len(chunk_meta) if chunk_meta else 0,
-    })
+    summary = _context_summary(
+        ctx_name,
+        content,
+        preview=content[:preview_chars],
+        has_chunks=chunk_meta is not None,
+        chunk_count=len(chunk_meta) if chunk_meta else 0,
+    )
+    return _text_response(summary)
 
 
 async def _handle_chunk_context(arguments: dict) -> list[TextContent]:
@@ -551,7 +583,7 @@ async def _handle_chunk_context(arguments: dict) -> list[TextContent]:
 
     error = _ensure_context_loaded(ctx_name)
     if error:
-        return _text_response(error)
+        return _error_response("context_not_found", error)
 
     content = contexts[ctx_name]["content"]
     chunks = _chunk_content(content, strategy, size)
@@ -585,18 +617,22 @@ async def _handle_get_chunk(arguments: dict) -> list[TextContent]:
 
     error = _ensure_context_loaded(ctx_name)
     if error:
-        return _text_response(error)
+        return _error_response("context_not_found", error)
 
     chunks = contexts[ctx_name].get("chunks")
     if not chunks:
         chunk_path = CHUNKS_DIR / ctx_name / f"{chunk_index}.txt"
         if chunk_path.exists():
             return _text_response(chunk_path.read_text())
-        return _text_response(f"Context '{ctx_name}' not chunked")
+        return _error_response(
+            "context_not_chunked",
+            f"Context '{ctx_name}' has not been chunked yet",
+        )
 
     if chunk_index >= len(chunks):
-        return _text_response(
-            f"Chunk index {chunk_index} out of range (max {len(chunks) - 1})"
+        return _error_response(
+            "chunk_out_of_range",
+            f"Chunk index {chunk_index} out of range (max {len(chunks) - 1})",
         )
 
     return _text_response(chunks[chunk_index])
@@ -611,7 +647,7 @@ async def _handle_filter_context(arguments: dict) -> list[TextContent]:
 
     error = _ensure_context_loaded(src_name)
     if error:
-        return _text_response(error)
+        return _error_response("context_not_found", error)
 
     content = contexts[src_name]["content"]
     lines = content.split("\n")
@@ -623,16 +659,15 @@ async def _handle_filter_context(arguments: dict) -> list[TextContent]:
         filtered = [line for line in lines if not regex.search(line)]
 
     new_content = "\n".join(filtered)
-    meta = {
-        "name": out_name,
-        "length": len(new_content),
-        "lines": len(filtered),
-        "hash": _hash_content(new_content),
-        "source": src_name,
-        "filter_pattern": pattern,
-        "filter_mode": mode,
-        "chunks": None,
-    }
+    meta = _context_summary(
+        out_name,
+        new_content,
+        hash=_hash_content(new_content),
+        source=src_name,
+        filter_pattern=pattern,
+        filter_mode=mode,
+        chunks=None,
+    )
     contexts[out_name] = {"meta": meta, "content": new_content}
     _save_context_to_disk(out_name, new_content, meta)
 
@@ -872,6 +907,112 @@ async def _handle_auto_analyze(arguments: dict) -> list[TextContent]:
     })
 
 
+async def _handle_exec(arguments: dict) -> list[TextContent]:
+    """Execute Python code against a loaded context in a sandboxed subprocess."""
+    code = arguments["code"]
+    ctx_name = arguments["context_name"]
+    timeout = arguments.get("timeout", 30)
+
+    # Ensure context is loaded
+    error = _ensure_context_loaded(ctx_name)
+    if error:
+        return _error_response("context_not_found", error)
+
+    content = contexts[ctx_name]["content"]
+
+    # Create a temporary Python file with the execution environment
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        temp_file = f.name
+        # Write the execution wrapper
+        f.write("""
+import sys
+import json
+import re
+import collections
+
+# Inject context as read-only variable
+context = sys.stdin.read()
+
+# User code execution
+result = None
+try:
+""")
+        # Indent user code
+        for line in code.split("\n"):
+            f.write(f"    {line}\n")
+
+        # Capture result
+        f.write("""
+    # Output result
+    if result is not None:
+        print("__RESULT_START__")
+        print(json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result))
+        print("__RESULT_END__")
+except Exception as e:
+    print(f"__ERROR__: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
+""")
+
+    try:
+        # Run the subprocess with minimal environment (no shell=True for security)
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        }
+
+        process = subprocess.run(
+            [sys.executable, temp_file],
+            input=content,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+
+        # Parse output
+        stdout = process.stdout
+        stderr = process.stderr
+        return_code = process.returncode
+
+        # Extract result
+        result = None
+        if "__RESULT_START__" in stdout and "__RESULT_END__" in stdout:
+            result_start = stdout.index("__RESULT_START__") + len("__RESULT_START__\n")
+            result_end = stdout.index("__RESULT_END__")
+            result_str = stdout[result_start:result_end].strip()
+            try:
+                result = json.loads(result_str)
+            except json.JSONDecodeError:
+                result = result_str
+
+            # Clean stdout
+            stdout = stdout[:stdout.index("__RESULT_START__")].strip()
+
+        return _text_response({
+            "result": result,
+            "stdout": stdout,
+            "stderr": stderr,
+            "return_code": return_code,
+            "timed_out": False,
+        })
+
+    except subprocess.TimeoutExpired:
+        return _text_response({
+            "result": None,
+            "stdout": "",
+            "stderr": f"Execution timed out after {timeout} seconds",
+            "return_code": -1,
+            "timed_out": True,
+        })
+    except Exception as e:
+        return _error_response("execution_error", str(e))
+    finally:
+        # Clean up temp file
+        try:
+            os.unlink(temp_file)
+        except Exception:
+            pass
+
+
 # Tool dispatch table
 TOOL_HANDLERS = {
     "rlm_load_context": _handle_load_context,
@@ -885,6 +1026,7 @@ TOOL_HANDLERS = {
     "rlm_list_contexts": _handle_list_contexts,
     "rlm_sub_query_batch": _handle_sub_query_batch,
     "rlm_auto_analyze": _handle_auto_analyze,
+    "rlm_exec": _handle_exec,
 }
 
 

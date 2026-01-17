@@ -76,6 +76,7 @@ Replace `/path/to/rlm` with your actual installation path.
 | `rlm_chunk_context` | Chunk by lines/chars/paragraphs |
 | `rlm_get_chunk` | Retrieve specific chunk |
 | `rlm_filter_context` | Filter with regex (keep/remove matching lines) |
+| `rlm_exec` | Execute Python code against loaded context (sandboxed) |
 | `rlm_sub_query` | Make sub-LLM call on chunk |
 | `rlm_sub_query_batch` | Process multiple chunks in parallel |
 | `rlm_store_result` | Store sub-call result for aggregation |
@@ -110,6 +111,95 @@ rlm_auto_analyze(
 | `extract_structure` | List functions, classes, schema, headings |
 | `security_audit` | Find vulnerabilities and security issues |
 | `answer:<question>` | Answer a custom question about the content |
+
+### Programmatic Analysis with `rlm_exec`
+
+For deterministic pattern matching and data extraction, use `rlm_exec` to run Python code directly against a loaded context. This is closer to the paper's REPL approach and provides full control over analysis logic.
+
+**Tool**: `rlm_exec`
+
+**Purpose**: Execute arbitrary Python code against a loaded context in a sandboxed subprocess.
+
+**Parameters**:
+- `code` (required): Python code to execute. Set the `result` variable to capture output.
+- `context_name` (required): Name of a previously loaded context.
+- `timeout` (optional, default 30): Maximum execution time in seconds.
+
+**Features**:
+- Context available as read-only `context` variable
+- Pre-imported modules: `re`, `json`, `collections`
+- Subprocess isolation (won't crash the server)
+- Timeout enforcement
+- Works on any system with Python (no Docker needed)
+
+**Example — Finding patterns in a loaded context**:
+
+```python
+# After loading a context
+rlm_exec(
+    code="""
+import re
+amounts = re.findall(r'\$[\d,]+', context)
+result = {'count': len(amounts), 'sample': amounts[:5]}
+""",
+    context_name="bill"
+)
+```
+
+**Example Response**:
+
+```json
+{
+  "result": {
+    "count": 1247,
+    "sample": ["$500", "$1,000", "$250,000", "$100,000", "$50"]
+  },
+  "stdout": "",
+  "stderr": "",
+  "return_code": 0,
+  "timed_out": false
+}
+```
+
+**Example — Extracting structured data**:
+
+```python
+rlm_exec(
+    code="""
+import re
+import json
+
+# Find all email addresses
+emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', context)
+
+# Count by domain
+from collections import Counter
+domains = [e.split('@')[1] for e in emails]
+domain_counts = Counter(domains)
+
+result = {
+    'total_emails': len(emails),
+    'unique_domains': len(domain_counts),
+    'top_domains': domain_counts.most_common(5)
+}
+""",
+    context_name="dataset",
+    timeout=60
+)
+```
+
+**When to use `rlm_exec` vs `rlm_sub_query`**:
+
+| Use Case | Tool | Why |
+|----------|------|-----|
+| Extract all dates, IDs, amounts | `rlm_exec` | Regex is deterministic and fast |
+| Find security vulnerabilities | `rlm_sub_query` | Requires reasoning and context |
+| Parse JSON/XML structure | `rlm_exec` | Standard libraries work perfectly |
+| Summarize themes or tone | `rlm_sub_query` | Natural language understanding needed |
+| Count word frequencies | `rlm_exec` | Simple computation, no AI needed |
+| Answer "Why did X happen?" | `rlm_sub_query` | Requires inference and reasoning |
+
+**Tip**: For large contexts, combine both — use `rlm_exec` to filter/extract, then `rlm_sub_query` for semantic analysis of filtered results.
 
 ## Providers
 
