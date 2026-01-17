@@ -18,7 +18,7 @@ dev = [
 ]
 
 [project.scripts]
-rlm-server = "src.server:main"
+rlm-server = "src.rlm_mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]

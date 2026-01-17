@@ -1,0 +1,12 @@
+{
+  "name": "RLM Large File Suggester",
+  "description": "Suggests using RLM tools when Claude attempts to read files larger than 10KB, helping prevent context bloat",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "command": ".claude/hooks/check-file-size.sh"
+      }
+    ]
+  }
+}

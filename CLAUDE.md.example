@@ -1,0 +1,76 @@
+# Project Instructions
+
+## Large Context Handling with RLM
+
+This project uses the RLM (Recursive Language Model) MCP server for handling contexts that exceed normal token limits.
+
+### When to Use RLM Tools Autonomously
+
+Claude should **automatically** reach for RLM tools when encountering:
+
+1. **Large files** - Any file >100KB or >2000 lines
+2. **Multi-file analysis** - Tasks requiring synthesis across multiple documents
+3. **Context overflow** - When combined context would exceed ~180K tokens
+4. **Deep codebases** - Analyzing entire repositories or large modules
+5. **Iterative refinement** - Tasks requiring multiple passes over the same content
+
+### RLM Pattern
+
+The standard flow is: **load → chunk → sub-query → aggregate**
+
+```
+1. Load large context into RLM memory (keeps it OUT of main window)
+2. Inspect/chunk the context into processable pieces
+3. Sub-query each chunk with focused questions (parallel when possible)
+4. Store results and aggregate into final answer
+```
+
+### Recognizing RLM-Appropriate Tasks
+
+**Use RLM when user says:**
+- "Analyze this entire codebase/repository"
+- "Summarize all these files"
+- "Find patterns across these documents"
+- "Review all test files for X"
+- "Extract all instances of Y from this large file"
+
+**Use RLM when you observe:**
+- File read returns >2000 lines
+- User provides multiple file paths to analyze together
+- Task requires multiple analytical passes
+- Context budget is getting tight
+
+### Available RLM Tools
+
+**Core workflow:**
+- `rlm_load_context` - Load large content into RLM memory (returns metadata only)
+- `rlm_inspect_context` - Preview structure without loading full content
+- `rlm_chunk_context` - Split by lines/chars/paragraphs
+- `rlm_get_chunk` - Retrieve specific chunk for processing
+- `rlm_list_contexts` - See all loaded contexts
+
+**Advanced operations:**
+- `rlm_filter_context` - Regex-based filtering to create focused subsets
+- `rlm_sub_query` - Send focused question to chunk via sub-LLM
+- `rlm_sub_query_batch` - Process multiple chunks in parallel (respects concurrency limits)
+- `rlm_store_result` - Save sub-query results for aggregation
+- `rlm_get_results` - Retrieve stored results for final synthesis
+
+### Example Usage Pattern
+
+```
+User: "Analyze all Python files in src/ for security issues"
+
+Claude's approach:
+1. Read file list, identify total size
+2. Load combined content with rlm_load_context
+3. Chunk by files or logical sections
+4. Use rlm_sub_query_batch to check each chunk for security patterns
+5. Store results with rlm_store_result
+6. Aggregate with rlm_get_results
+7. Present unified findings
+```
+
+### Key Principle
+
+**Preserve main context window** - Don't load massive files into the main conversation. Use RLM to process them externally and return only the insights.
