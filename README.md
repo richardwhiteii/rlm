@@ -18,7 +18,7 @@ Instead of feeding massive contexts directly into the LLM:
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/rlm.git
+git clone https://github.com/richardwhiteii/rlm.git
 cd rlm
 python -m venv .venv
 source .venv/bin/activate
