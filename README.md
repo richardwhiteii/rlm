@@ -20,6 +20,11 @@ Instead of feeding massive contexts directly into the LLM:
 ```bash
 git clone https://github.com/richardwhiteii/rlm.git
 cd rlm
+uv sync
+```
+
+Or with pip:
+```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -29,6 +34,23 @@ pip install -e .
 
 Add to `~/.claude/.mcp.json`:
 
+```json
+{
+  "mcpServers": {
+    "rlm": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/rlm", "python", "-m", "src.rlm_mcp_server"],
+      "env": {
+        "RLM_DATA_DIR": "/path/to/data/rlm"
+      }
+    }
+  }
+}
+```
+
+Replace `/path/to/rlm` with your actual installation path.
+
+**Alternative** (if not using uv):
 ```json
 {
   "mcpServers": {
@@ -43,8 +65,6 @@ Add to `~/.claude/.mcp.json`:
   }
 }
 ```
-
-Replace `/path/to/rlm` with your actual installation path.
 
 ## Tools
 
@@ -106,9 +126,8 @@ If you have [Ollama](https://ollama.ai) installed locally, you can run sub-queri
    {
      "mcpServers": {
        "rlm": {
-         "command": "/path/to/rlm/.venv/bin/python",
-         "args": ["-m", "src.rlm_mcp_server"],
-         "cwd": "/path/to/rlm",
+         "command": "uv",
+         "args": ["run", "--directory", "/path/to/rlm", "python", "-m", "src.rlm_mcp_server"],
          "env": {
            "RLM_DATA_DIR": "/path/to/data/rlm",
            "OLLAMA_URL": "http://localhost:11434"
