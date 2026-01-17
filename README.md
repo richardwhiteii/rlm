@@ -70,6 +70,7 @@ Replace `/path/to/rlm` with your actual installation path.
 
 | Tool | Purpose |
 |------|---------|
+| `rlm_auto_analyze` | **One-step analysis** — auto-detects type, chunks, and queries |
 | `rlm_load_context` | Load context as external variable |
 | `rlm_inspect_context` | Get structure info without loading into prompt |
 | `rlm_chunk_context` | Chunk by lines/chars/paragraphs |
@@ -80,6 +81,35 @@ Replace `/path/to/rlm` with your actual installation path.
 | `rlm_store_result` | Store sub-call result for aggregation |
 | `rlm_get_results` | Retrieve stored results |
 | `rlm_list_contexts` | List all loaded contexts |
+
+### Quick Analysis with `rlm_auto_analyze`
+
+For most use cases, just use `rlm_auto_analyze` — it handles everything automatically:
+
+```python
+rlm_auto_analyze(
+    name="my_file",
+    content=file_content,
+    goal="find_bugs"  # or: summarize, extract_structure, security_audit, answer:<question>
+)
+```
+
+**What it does automatically:**
+1. Detects content type (Python, JSON, Markdown, logs, prose, code)
+2. Selects optimal chunking strategy
+3. Adapts the query for the content type
+4. Runs parallel sub-queries
+5. Returns aggregated results
+
+**Supported goals:**
+
+| Goal | Description |
+|------|-------------|
+| `summarize` | Summarize content purpose and key points |
+| `find_bugs` | Identify errors, issues, potential problems |
+| `extract_structure` | List functions, classes, schema, headings |
+| `security_audit` | Find vulnerabilities and security issues |
+| `answer:<question>` | Answer a custom question about the content |
 
 ## Providers
 
