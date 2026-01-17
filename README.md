@@ -32,34 +32,40 @@ pip install -e .
 
 ### Wire to Claude Code
 
-Add to `~/.claude/.mcp.json`:
+First, find your installation path:
+```bash
+cd rlm && pwd
+# Example output: /Users/your_username/projects/rlm
+```
+
+Add to `~/.claude/.mcp.json`, replacing the example paths with your own:
 
 ```json
 {
   "mcpServers": {
     "rlm": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/rlm", "python", "-m", "src.rlm_mcp_server"],
+      "args": ["run", "--directory", "/Users/your_username/projects/rlm", "python", "-m", "src.rlm_mcp_server"],
       "env": {
-        "RLM_DATA_DIR": "/path/to/data/rlm"
+        "RLM_DATA_DIR": "/Users/your_username/.rlm-data"
       }
     }
   }
 }
 ```
 
-Replace `/path/to/rlm` with your actual installation path.
+> **Note**: Replace `/Users/your_username/projects/rlm` with the output from `pwd` above. The `RLM_DATA_DIR` is where RLM stores contexts and results — you can use any directory you prefer.
 
 **Alternative** (if not using uv):
 ```json
 {
   "mcpServers": {
     "rlm": {
-      "command": "/path/to/rlm/.venv/bin/python",
+      "command": "/Users/your_username/projects/rlm/.venv/bin/python",
       "args": ["-m", "src.rlm_mcp_server"],
-      "cwd": "/path/to/rlm",
+      "cwd": "/Users/your_username/projects/rlm",
       "env": {
-        "RLM_DATA_DIR": "/path/to/data/rlm"
+        "RLM_DATA_DIR": "/Users/your_username/.rlm-data"
       }
     }
   }
@@ -220,14 +226,14 @@ Copy `CLAUDE.md.example` content to your project's `CLAUDE.md` (or `~/.claude/CL
 **2. Hook Installation**
 Copy the `.claude/hooks/` directory to your project to auto-suggest RLM when reading files >10KB:
 ```bash
-cp -r .claude/hooks/ /path/to/your-project/.claude/hooks/
+cp -r .claude/hooks/ /Users/your_username/your-project/.claude/hooks/
 ```
 The hook provides guidance but doesn't block reads.
 
 **3. Skill Reference**
 Copy the `.claude/skills/` directory for comprehensive RLM guidance:
 ```bash
-cp -r .claude/skills/ /path/to/your-project/.claude/skills/
+cp -r .claude/skills/ /Users/your_username/your-project/.claude/skills/
 ```
 
 With these in place, Claude will autonomously detect when to use RLM instead of reading large files directly into context.
@@ -247,9 +253,9 @@ If you have [Ollama](https://ollama.ai) installed locally, you can run sub-queri
      "mcpServers": {
        "rlm": {
          "command": "uv",
-         "args": ["run", "--directory", "/path/to/rlm", "python", "-m", "src.rlm_mcp_server"],
+         "args": ["run", "--directory", "/Users/your_username/projects/rlm", "python", "-m", "src.rlm_mcp_server"],
          "env": {
-           "RLM_DATA_DIR": "/path/to/data/rlm",
+           "RLM_DATA_DIR": "/Users/your_username/.rlm-data",
            "OLLAMA_URL": "http://localhost:11434"
          }
        }
