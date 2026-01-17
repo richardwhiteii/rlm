@@ -211,6 +211,45 @@ rlm_sub_query_batch(
 
 Result: Comprehensive topic extraction at $0 cost.
 
+### Analyzing War and Peace (3.3MB)
+
+Literary analysis of Tolstoy's epic novel from Project Gutenberg:
+
+```bash
+# Download the text
+curl -o war_and_peace.txt https://www.gutenberg.org/files/2600/2600-0.txt
+```
+
+```python
+# Load into RLM (3.3MB, 66K lines)
+rlm_load_context(name="war_and_peace", content=open("war_and_peace.txt").read())
+
+# Chunk by lines (1000 lines per chunk = 67 chunks)
+rlm_chunk_context(name="war_and_peace", strategy="lines", size=1000)
+
+# Sample 10 chunks evenly across the book (15% coverage)
+sample_indices = [0, 7, 14, 21, 28, 35, 42, 49, 56, 63]
+
+# Extract characters from each sampled section
+rlm_sub_query_batch(
+    query="List major characters in this section with brief descriptions.",
+    context_name="war_and_peace",
+    chunk_indices=sample_indices,
+    provider="claude-sdk",  # Haiku 4.5
+    concurrency=8
+)
+```
+
+Result: Complete character arc across the novel — Pierre's journey from idealist to prisoner to husband, Natásha's growth, Prince Andrew's philosophical struggles — all for ~$0.03.
+
+| Metric | Value |
+|--------|-------|
+| File size | 3.35 MB |
+| Lines | 66,033 |
+| Chunks | 67 |
+| Sampled | 10 (15%) |
+| Cost | ~$0.03 |
+
 ## Data Storage
 
 ```
