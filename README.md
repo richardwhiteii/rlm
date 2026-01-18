@@ -4,6 +4,15 @@ Recursive Language Model patterns for Claude Code — handle massive contexts (1
 
 Based on: https://arxiv.org/html/2512.24601v1
 
+## How Users Interact
+
+You don't call RLM tools directly. You ask Claude to analyze large files, and Claude uses RLM behind the scenes.
+
+**Example:**
+- You say: "Analyze this 2MB log file for errors"
+- Claude uses RLM tools internally
+- You get: "I found 3 error patterns: database timeouts (47), auth failures (23)..."
+
 ## Core Idea
 
 Instead of feeding massive contexts directly into the LLM:
@@ -30,7 +39,7 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-### Wire to Claude Code
+### Configure for Claude Code
 
 First, find your installation path:
 ```bash
@@ -72,7 +81,31 @@ Add to `~/.claude/.mcp.json`, replacing the example paths with your own:
 }
 ```
 
+## Enable Auto-Detection
+
+Enable Claude to use RLM tools automatically without manual invocation:
+
+**1. CLAUDE.md Integration**
+Copy `CLAUDE.md.example` content to your project's `CLAUDE.md` (or `~/.claude/CLAUDE.md` for global) to teach Claude when to reach for RLM tools automatically.
+
+**2. Hook Installation**
+Copy the `.claude/hooks/` directory to your project to auto-suggest RLM when reading files >25KB:
+```bash
+cp -r .claude/hooks/ /Users/your_username/your-project/.claude/hooks/
+```
+The hook provides guidance but doesn't block reads.
+
+**3. Skill Reference**
+Copy the `.claude/skills/` directory for comprehensive RLM guidance:
+```bash
+cp -r .claude/skills/ /Users/your_username/your-project/.claude/skills/
+```
+
+With these in place, Claude will autonomously detect when to use RLM instead of reading large files directly into context.
+
 ## Tools
+
+> These tools are used by Claude internally when processing large contexts. You don't call them directly—you just ask Claude to analyze large files.
 
 | Tool | Purpose |
 |------|---------|
@@ -91,7 +124,7 @@ Add to `~/.claude/.mcp.json`, replacing the example paths with your own:
 
 ### Quick Analysis with `rlm_auto_analyze`
 
-For most use cases, just use `rlm_auto_analyze` — it handles everything automatically:
+For most use cases, Claude uses `rlm_auto_analyze` — it handles everything automatically:
 
 ```python
 rlm_auto_analyze(
@@ -120,7 +153,7 @@ rlm_auto_analyze(
 
 ### Programmatic Analysis with `rlm_exec`
 
-For deterministic pattern matching and data extraction, use `rlm_exec` to run Python code directly against a loaded context. This is closer to the paper's REPL approach and provides full control over analysis logic.
+For deterministic pattern matching and data extraction, Claude can use `rlm_exec` to run Python code directly against a loaded context. This is closer to the paper's REPL approach and provides full control over analysis logic.
 
 **Tool**: `rlm_exec`
 
@@ -239,33 +272,11 @@ rlm_sub_query(
 3. Each recursive call decrements the depth limit until `max_depth` is reached
 4. The response includes recursion metadata: `depth_reached` and `call_trace`
 
-**Recommended model for recursive calls**: 'gemma3:27b' I'm recommending a local model due to the potential recursive cost escalation. 
+**Recommended for recursive calls**: Use a local model like `gemma3:27b` via Ollama to avoid cost escalation from deep recursion.
 
-## Autonomous Usage
+## Using Ollama (Free Local Inference)
 
-Enable Claude to use RLM tools automatically without manual invocation:
-
-**1. CLAUDE.md Integration**
-Copy `CLAUDE.md.example` content to your project's `CLAUDE.md` (or `~/.claude/CLAUDE.md` for global) to teach Claude when to reach for RLM tools automatically.
-
-**2. Hook Installation**
-Copy the `.claude/hooks/` directory to your project to auto-suggest RLM when reading files >10KB:
-```bash
-cp -r .claude/hooks/ /Users/your_username/your-project/.claude/hooks/
-```
-The hook provides guidance but doesn't block reads.
-
-**3. Skill Reference**
-Copy the `.claude/skills/` directory for comprehensive RLM guidance:
-```bash
-cp -r .claude/skills/ /Users/your_username/your-project/.claude/skills/
-```
-
-With these in place, Claude will autonomously detect when to use RLM instead of reading large files directly into context.
-
-### Using Ollama (Free Local Inference)
-
-If you have [Ollama](https://ollama.ai) installed locally, you can run sub-queries at zero cost:
+With [Ollama](https://ollama.ai) installed locally, you can run sub-queries at zero cost:
 
 1. **Install Ollama** and pull a model:
    ```bash
@@ -288,7 +299,7 @@ If you have [Ollama](https://ollama.ai) installed locally, you can run sub-queri
    }
    ```
 
-3. **Specify provider** in your sub-queries:
+3. **Specify provider** in sub-queries:
    ```
    rlm_sub_query(
        query="Summarize this section",
@@ -309,7 +320,7 @@ rlm_sub_query_batch(
 )
 ```
 
-## Usage Example
+## Usage Examples
 
 ### Basic Pattern
 
@@ -338,66 +349,56 @@ rlm_store_result(name="topics", result=<response>)
 rlm_get_results(name="topics")
 ```
 
-### Processing a 2MB Document
+### Analyzing Encyclopedia Britannica (11MB)
 
-Tested with H.R.1 Bill (2MB):
-
-```
-# Load
-rlm_load_context(name="bill", content=<2MB XML>)
-
-# Chunk into 40 pieces (50K chars each)
-rlm_chunk_context(name="bill", strategy="chars", size=50000)
-
-# Sample 8 chunks (20%) with parallel queries
-rlm_sub_query_batch(
-    query="What topics does this section cover?",
-    context_name="bill",
-    chunk_indices=[0, 5, 10, 15, 20, 25, 30, 35],
-    concurrency=4  # uses claude-sdk by default; add provider="ollama" for free local inference
-)
-```
-
-Result: Comprehensive topic extraction at $0 cost.
-
-### Analyzing War and Peace (3.3MB)
-
-Literary analysis of Tolstoy's epic novel from Project Gutenberg:
-
-```bash
-# Download the text
-curl -o war_and_peace.txt https://www.gutenberg.org/files/2600/2600-0.txt
-```
+The flagship example of RLM capabilities — processing the Encyclopedia Britannica, 11th Edition from Project Gutenberg:
 
 ```python
-# Load into RLM (3.3MB, 66K lines)
-rlm_load_context(name="war_and_peace", content=open("war_and_peace.txt").read())
+# Load the full encyclopedia (11MB, ~2M tokens)
+content = open("docs/encyclopedia/merged_encyclopedia.txt").read()
+rlm_load_context(name="encyclopedia", content=content)
 
-# Chunk by lines (1000 lines per chunk = 67 chunks)
-rlm_chunk_context(name="war_and_peace", strategy="lines", size=1000)
+# Inspect
+rlm_inspect_context(name="encyclopedia")
+# → 11MB, 184K lines, ~2M tokens
 
-# Sample 10 chunks evenly across the book (15% coverage)
-sample_indices = [0, 7, 14, 21, 28, 35, 42, 49, 56, 63]
+# Chunk for processing
+rlm_chunk_context(name="encyclopedia", strategy="paragraphs", size=30)
 
-# Extract characters from each sampled section
+# Query across the corpus
 rlm_sub_query_batch(
-    query="List major characters in this section with brief descriptions.",
-    context_name="war_and_peace",
-    chunk_indices=sample_indices,
-    provider="claude-sdk",  # Haiku 4.5
-    concurrency=8
+    query="Summarize the main topics in this section",
+    context_name="encyclopedia",
+    chunk_indices=[0, 50, 100, 150],
+    provider="claude-sdk"  # or "ollama" for free local inference
 )
 ```
 
-Result: Complete character arc across the novel — Pierre's journey from idealist to prisoner to husband, Natásha's growth, Prince Andrew's philosophical struggles — all for ~$0.03.
+**Extract Topic Catalog**:
+
+```python
+# Filter for specific subject
+rlm_filter_context(
+    name="encyclopedia",
+    output_name="botany",
+    pattern="(?i)(botan|plant|flora|flower|genus)",
+    mode="keep"
+)
+
+# Analyze filtered content
+rlm_auto_analyze(
+    name="botany_analysis",
+    content=filtered_content,
+    goal="answer:List all botanical articles with brief descriptions"
+)
+```
 
 | Metric | Value |
 |--------|-------|
-| File size | 3.35 MB |
-| Lines | 66,033 |
-| Chunks | 67 |
-| Sampled | 10 (15%) |
-| Cost | ~$0.03 |
+| File size | 11 MB |
+| Lines | 184,000 |
+| Tokens | ~2M |
+| Processing cost | $0 (Ollama) or ~$1.60 (Haiku) |
 
 ## Data Storage
 
@@ -423,9 +424,9 @@ RLM MCP Server
     └─► ollama ─► Local LLM (gemma3:27b, llama3, etc.)
 ```
 
-The key insight: **context stays external**. Instead of stuffing 2MB into your prompt, load it once, chunk it, and make targeted sub-queries. Claude orchestrates; sub-models do the heavy lifting.
+The key insight: **context stays external, not in your prompt**. Claude orchestrates; sub-models analyze.
 
-## Learning Prompts
+## For Contributors: Learning the Codebase
 
 Use these prompts with Claude Code to explore the codebase and learn RLM patterns. The code is the single source of truth.
 
