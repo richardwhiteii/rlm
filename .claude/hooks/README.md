@@ -4,11 +4,18 @@
 
 **File:** `check-file-size.sh`
 
-This PreToolUse hook intercepts `Read` tool calls and suggests using RLM tools when files exceed a configurable threshold.
+This PreToolUse hook intercepts `Read` tool calls and suggests using RLM tools when files exceed configurable thresholds.
 
 ### Behavior
 
-- **Threshold:** 25KB (configurable via `RLM_SIZE_THRESHOLD` env var)
+Triggers when **EITHER** threshold is exceeded:
+- **Size threshold:** 25KB (configurable via `RLM_SIZE_THRESHOLD` env var)
+- **Token threshold:** 10K tokens (configurable via `RLM_TOKEN_THRESHOLD` env var)
+
+Token estimation uses ~4 characters per token (conservative estimate).
+
+**Why token threshold matters:** Claude's Read tool **hard-fails at 25K tokens**. The 10K token threshold warns early so you can use RLM before hitting the hard limit.
+
 - **Action:** Suggests RLM tools but does NOT block the read
 - **Output:** JSON with `decision: "approve"` and optional `reason` message
 
@@ -74,16 +81,33 @@ The hook is configured in `.claude/settings.json`:
    # Output: {"decision": "approve"}
    ```
 
-#### Customizing Threshold
+#### Customizing Thresholds
 
-Set `RLM_SIZE_THRESHOLD` environment variable (in bytes):
+**Size threshold** (`RLM_SIZE_THRESHOLD` in bytes):
 
 ```bash
-# Use 50KB threshold
+# Use 50KB size threshold
 RLM_SIZE_THRESHOLD=51200 echo '{"tool_input": {"file_path": "somefile.txt"}}' | .claude/hooks/check-file-size.sh
 
-# Use 1MB threshold
+# Use 1MB size threshold
 RLM_SIZE_THRESHOLD=1048576 echo '{"tool_input": {"file_path": "somefile.txt"}}' | .claude/hooks/check-file-size.sh
+```
+
+**Token threshold** (`RLM_TOKEN_THRESHOLD` in tokens):
+
+```bash
+# Use 5K token threshold (more aggressive, catches smaller files)
+RLM_TOKEN_THRESHOLD=5000 echo '{"tool_input": {"file_path": "somefile.txt"}}' | .claude/hooks/check-file-size.sh
+
+# Use 20K token threshold (closer to hard limit)
+RLM_TOKEN_THRESHOLD=20000 echo '{"tool_input": {"file_path": "somefile.txt"}}' | .claude/hooks/check-file-size.sh
+```
+
+**Both thresholds together:**
+
+```bash
+# Custom size (100KB) and token (15K) thresholds
+RLM_SIZE_THRESHOLD=102400 RLM_TOKEN_THRESHOLD=15000 .claude/hooks/check-file-size.sh
 ```
 
 ### Integration Testing with Claude Code
