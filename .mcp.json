@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rlm": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "src.rlm_mcp_server"],
+      "env": {
+        "RLM_DATA_DIR": ".rlm-data",
+        "OLLAMA_URL": "http://localhost:11434"
+      }
+    }
+  }
+}

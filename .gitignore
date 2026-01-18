@@ -47,3 +47,9 @@ data/
 CLAUDE.md
 WORLD.md
 docs/conversation.md
+
+# Test fixtures (large files for hook testing)
+tests/fixtures/large_*
+
+# RLM runtime data
+.rlm-data/
