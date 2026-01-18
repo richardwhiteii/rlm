@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,9 +50,29 @@ server = Server("rlm")
 
 # Default models per provider
 DEFAULT_MODELS = {
-    "ollama": "gemma3:27b",
+    "ollama": "olmo-3.1:32b",
     "claude-sdk": "claude-haiku-4-5-20251101",
 }
+
+
+@dataclass
+class RecursionState:
+    """Track recursion depth to prevent infinite loops in sub-queries."""
+    current_depth: int = 0
+    max_depth: int = 3
+    call_trace: list[str] = field(default_factory=list)
+
+    def can_recurse(self) -> bool:
+        """Check if further recursion is allowed."""
+        return self.current_depth < self.max_depth
+
+    def descend(self, call_id: str) -> "RecursionState":
+        """Create a new state for a deeper recursion level."""
+        return RecursionState(
+            current_depth=self.current_depth + 1,
+            max_depth=self.max_depth,
+            call_trace=self.call_trace + [call_id],
+        )
 
 
 def _hash_content(content: str) -> str:
@@ -123,42 +144,177 @@ PROVIDER_SCHEMA = {
     "type": "string",
     "enum": ["ollama", "claude-sdk"],
     "description": "LLM provider for sub-call",
-    "default": "ollama",
-}
-
-PROVIDER_SCHEMA_CLAUDE_DEFAULT = {
-    **PROVIDER_SCHEMA,
-    "description": "LLM provider for sub-calls",
     "default": "claude-sdk",
 }
 
 
-async def _call_ollama(query: str, context_content: str, model: str) -> tuple[Optional[str], Optional[str]]:
-    """Make a sub-call to Ollama. Returns (result, error)."""
+
+async def _handle_ollama_tool_calls(
+    client: httpx.AsyncClient,
+    ollama_url: str,
+    model: str,
+    messages: list[dict],
+    tools: list[dict],
+    state: "RecursionState",
+    max_iterations: int = 5,
+) -> tuple[Optional[str], Optional[str], "RecursionState"]:
+    """Handle Ollama tool calls in an agent loop.
+
+    Implements the agent loop pattern:
+    1. Get tool_calls from last message
+    2. Execute each tool call via TOOL_HANDLERS
+    3. Append tool result as {"role": "tool", "content": result_text}
+    4. Send follow-up request to continue conversation
+    5. Repeat until no more tool calls or max_iterations reached
+    """
+    current_messages = messages.copy()
+    current_state = state
+
+    for iteration in range(max_iterations):
+        # Send request to Ollama
+        request_body = {
+            "model": model,
+            "messages": current_messages,
+            "stream": False,
+        }
+
+        # Only include tools if we can still recurse
+        if tools and current_state.can_recurse():
+            request_body["tools"] = tools
+
+        response = await client.post(
+            f"{ollama_url}/api/chat",
+            json=request_body,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        message = result.get("message", {})
+        tool_calls = message.get("tool_calls", [])
+
+        # If no tool calls, return the content
+        if not tool_calls:
+            return message.get("content", ""), None, current_state
+
+        # Append assistant message with tool calls
+        current_messages.append(message)
+
+        # Process each tool call
+        for tool_call in tool_calls:
+            function_info = tool_call.get("function", {})
+            tool_name = function_info.get("name", "")
+            tool_args = function_info.get("arguments", {})
+
+            # Parse arguments if they're a string
+            if isinstance(tool_args, str):
+                try:
+                    tool_args = json.loads(tool_args)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+            # Execute the tool
+            handler = TOOL_HANDLERS.get(tool_name)
+            if handler:
+                # Descend recursion state for the tool call
+                call_id = f"{tool_name}:{iteration}"
+                child_state = current_state.descend(call_id)
+
+                try:
+                    tool_result = await handler(tool_args)
+                    result_text = tool_result[0].text if tool_result else ""
+                except Exception as e:
+                    result_text = json.dumps({"error": str(e)})
+
+                current_state = child_state
+            else:
+                result_text = json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+            # Append tool result
+            current_messages.append({
+                "role": "tool",
+                "content": result_text,
+            })
+
+    # Max iterations reached - return last content or error
+    last_message = current_messages[-1] if current_messages else {}
+    content = last_message.get("content", "")
+    if last_message.get("role") == "tool":
+        # Last message was a tool result, need to get final response
+        return content, "max_iterations_reached", current_state
+
+    return content, None, current_state
+
+
+async def _call_ollama(
+    query: str,
+    context_content: str,
+    model: str,
+    tools: list[dict] | None = None,
+    state: Optional["RecursionState"] = None,
+) -> tuple[Optional[str], Optional[str], Optional["RecursionState"]]:
+    """Make a sub-call to Ollama using /api/chat endpoint.
+
+    Returns (result, error, updated_state).
+    When tools and state are provided, enables recursive tool calling.
+    """
     if not HAS_HTTPX:
-        return None, "httpx required for Ollama calls"
+        return None, "httpx required for Ollama calls", state
 
     ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+
+    messages = [{"role": "user", "content": f"{query}\n\nContext:\n{context_content}"}]
+
     try:
         async with httpx.AsyncClient(timeout=180.0) as client:
+            # Build request body
+            request_body = {
+                "model": model,
+                "messages": messages,
+                "stream": False,
+            }
+
+            # Include tools if provided and recursion is allowed
+            if tools and state and state.can_recurse():
+                request_body["tools"] = tools
+
             response = await client.post(
-                f"{ollama_url}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": f"{query}\n\nContext:\n{context_content}",
-                    "stream": False,
-                },
+                f"{ollama_url}/api/chat",
+                json=request_body,
             )
             response.raise_for_status()
-            return response.json().get("response", ""), None
+            result = response.json()
+
+            message = result.get("message", {})
+            tool_calls = message.get("tool_calls", [])
+
+            # If there are tool calls and we have state, handle them
+            if tool_calls and state:
+                messages.append(message)
+                return await _handle_ollama_tool_calls(
+                    client, ollama_url, model, messages, tools or [], state, max_iterations=5
+                )
+
+            # No tool calls - return content directly
+            return message.get("content", ""), None, state
+
     except Exception as e:
-        return None, str(e)
+        return None, str(e), state
 
 
-async def _call_claude_sdk(query: str, context_content: str, model: str) -> tuple[Optional[str], Optional[str]]:
-    """Make a sub-call to Claude SDK. Returns (result, error)."""
+async def _call_claude_sdk(
+    query: str,
+    context_content: str,
+    model: str,
+    tools: list[dict] | None = None,
+    state: Optional["RecursionState"] = None,
+) -> tuple[Optional[str], Optional[str], Optional["RecursionState"]]:
+    """Make a sub-call to Claude SDK.
+
+    Returns (result, error, updated_state).
+    Note: Tool handling in Claude SDK is simplified (max_turns=1) for now.
+    """
     if not HAS_CLAUDE_SDK:
-        return None, "claude-agent-sdk required for claude-sdk provider"
+        return None, "claude-agent-sdk required for claude-sdk provider", state
 
     try:
         prompt = f"{query}\n\nContext:\n{context_content}"
@@ -179,9 +335,40 @@ async def _call_claude_sdk(query: str, context_content: str, model: str) -> tupl
                     texts.append(str(content))
 
         result = "\n".join(texts) if texts else ""
-        return result, None
+        return result, None, state
     except Exception as e:
-        return None, str(e)
+        return None, str(e), state
+
+
+def _get_rlm_tools_for_subcall() -> list[dict]:
+    """Generate RLM tool definitions in OpenAI-compatible format for sub-calls.
+
+    Returns a subset of tools suitable for recursive calls. This includes
+    tools for context manipulation and querying, but excludes tools that
+    would be redundant or dangerous in recursive contexts.
+    """
+    # Tools to expose in recursive sub-calls
+    recursive_tool_names = {
+        "rlm_chunk_context",
+        "rlm_get_chunk",
+        "rlm_filter_context",
+        "rlm_sub_query",
+        "rlm_inspect_context",
+        "rlm_list_contexts",
+    }
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema,
+            }
+        }
+        for tool in TOOL_DEFINITIONS
+        if tool.name in recursive_tool_names
+    ]
 
 
 async def _make_provider_call(
@@ -189,14 +376,20 @@ async def _make_provider_call(
     model: str,
     query: str,
     context_content: str,
-) -> tuple[Optional[str], Optional[str]]:
-    """Route a sub-call to the appropriate provider. Returns (result, error)."""
+    tools: list[dict] | None = None,
+    state: Optional["RecursionState"] = None,
+) -> tuple[Optional[str], Optional[str], Optional["RecursionState"]]:
+    """Route a sub-call to the appropriate provider.
+
+    Returns (result, error, updated_state).
+    When tools and state are provided, enables recursive tool calling.
+    """
     if provider == "ollama":
-        return await _call_ollama(query, context_content, model)
+        return await _call_ollama(query, context_content, model, tools, state)
     elif provider == "claude-sdk":
-        return await _call_claude_sdk(query, context_content, model)
+        return await _call_claude_sdk(query, context_content, model, tools, state)
     else:
-        return None, f"Unknown provider: {provider}"
+        return None, f"Unknown provider: {provider}", state
 
 
 def _chunk_content(content: str, strategy: str, size: int) -> list[str]:
@@ -403,7 +596,7 @@ TOOL_DEFINITIONS = [
     ),
     Tool(
         name="rlm_sub_query",
-        description="Make a sub-LLM call on a chunk or filtered context. Core of recursive pattern.",
+        description="Make a sub-LLM call on a chunk or filtered context. Core of recursive pattern. Set max_depth > 0 to allow the sub-LLM to use RLM tools for hierarchical decomposition.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -414,6 +607,13 @@ TOOL_DEFINITIONS = [
                 "model": {
                     "type": "string",
                     "description": "Model to use (provider-specific defaults apply)",
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum recursion depth. 0 = no recursion (default), 1-5 = allow sub-queries to use RLM tools",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 5,
                 },
             },
             "required": ["query", "context_name"],
@@ -453,7 +653,7 @@ TOOL_DEFINITIONS = [
     ),
     Tool(
         name="rlm_sub_query_batch",
-        description="Process multiple chunks in parallel. Respects concurrency limit to manage system resources.",
+        description="Process multiple chunks in parallel. Respects concurrency limit to manage system resources. Set max_depth > 0 to allow sub-LLMs to use RLM tools for hierarchical decomposition.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -474,6 +674,13 @@ TOOL_DEFINITIONS = [
                     "description": "Max parallel requests (default 4, max 8)",
                     "default": 4,
                 },
+                "max_depth": {
+                    "type": "integer",
+                    "description": "Maximum recursion depth. 0 = no recursion (default), 1-5 = allow sub-queries to use RLM tools",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 5,
+                },
             },
             "required": ["query", "context_name", "chunk_indices"],
         },
@@ -490,7 +697,7 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "Analysis goal: 'summarize', 'find_bugs', 'extract_structure', 'security_audit', or 'answer:<your question>'",
                 },
-                "provider": PROVIDER_SCHEMA_CLAUDE_DEFAULT,
+                "provider": PROVIDER_SCHEMA,
                 "concurrency": {
                     "type": "integer",
                     "description": "Max parallel requests (default 4, max 8)",
@@ -685,8 +892,9 @@ async def _handle_sub_query(arguments: dict) -> list[TextContent]:
     query = arguments["query"]
     ctx_name = arguments["context_name"]
     chunk_index = arguments.get("chunk_index")
-    provider = arguments.get("provider", "ollama")
-    model = arguments.get("model") or DEFAULT_MODELS.get(provider, "gemma3:27b")
+    provider = arguments.get("provider", "claude-sdk")
+    model = arguments.get("model") or DEFAULT_MODELS.get(provider, "claude-haiku-4-5-20250514")
+    max_depth = arguments.get("max_depth", 0)
 
     error = _ensure_context_loaded(ctx_name)
     if error:
@@ -702,7 +910,13 @@ async def _handle_sub_query(arguments: dict) -> list[TextContent]:
     else:
         context_content = contexts[ctx_name]["content"]
 
-    result, error = await _make_provider_call(provider, model, query, context_content)
+    # Set up recursion state and tools if max_depth > 0
+    state = RecursionState(max_depth=max_depth) if max_depth > 0 else None
+    tools = _get_rlm_tools_for_subcall() if max_depth > 0 else None
+
+    result, error, final_state = await _make_provider_call(
+        provider, model, query, context_content, tools, state
+    )
 
     if error:
         return _text_response({
@@ -712,11 +926,21 @@ async def _handle_sub_query(arguments: dict) -> list[TextContent]:
             "message": error,
         })
 
-    return _text_response({
+    response = {
         "provider": provider,
         "model": model,
         "response": result,
-    })
+    }
+
+    # Include recursion info if state was used
+    if final_state:
+        response["recursion"] = {
+            "max_depth": max_depth,
+            "depth_reached": final_state.current_depth,
+            "call_trace": final_state.call_trace,
+        }
+
+    return _text_response(response)
 
 
 async def _handle_store_result(arguments: dict) -> list[TextContent]:
@@ -781,9 +1005,10 @@ async def _handle_sub_query_batch(arguments: dict) -> list[TextContent]:
     query = arguments["query"]
     ctx_name = arguments["context_name"]
     chunk_indices = arguments["chunk_indices"]
-    provider = arguments.get("provider", "ollama")
-    model = arguments.get("model") or DEFAULT_MODELS.get(provider, "gemma3:27b")
+    provider = arguments.get("provider", "claude-sdk")
+    model = arguments.get("model") or DEFAULT_MODELS.get(provider, "claude-haiku-4-5-20250514")
     concurrency = min(arguments.get("concurrency", 4), 8)
+    max_depth = arguments.get("max_depth", 0)
 
     error = _ensure_context_loaded(ctx_name)
     if error:
@@ -803,13 +1028,26 @@ async def _handle_sub_query_batch(arguments: dict) -> list[TextContent]:
             f"Invalid chunk indices: {invalid_indices} (max: {len(chunks) - 1})",
         )
 
+    # Set up tools for recursion if max_depth > 0
+    tools = _get_rlm_tools_for_subcall() if max_depth > 0 else None
+
+    # Track recursion stats across the batch
+    max_depth_reached = 0
+    total_recursive_calls = 0
+
     semaphore = asyncio.Semaphore(concurrency)
 
     async def process_chunk(chunk_idx: int) -> dict:
+        nonlocal max_depth_reached, total_recursive_calls
+
         async with semaphore:
             chunk_content = chunks[chunk_idx]
-            result, error = await _make_provider_call(
-                provider, model, query, chunk_content
+
+            # Create fresh state for each chunk to avoid cross-contamination
+            state = RecursionState(max_depth=max_depth) if max_depth > 0 else None
+
+            result, error, final_state = await _make_provider_call(
+                provider, model, query, chunk_content, tools, state
             )
 
             if error:
@@ -819,26 +1057,47 @@ async def _handle_sub_query_batch(arguments: dict) -> list[TextContent]:
                     "message": error,
                 }
 
-            return {
+            chunk_result = {
                 "chunk_index": chunk_idx,
                 "response": result,
                 "provider": provider,
                 "model": model,
             }
 
+            # Track recursion stats
+            if final_state:
+                chunk_result["recursion"] = {
+                    "depth_reached": final_state.current_depth,
+                    "call_trace": final_state.call_trace,
+                }
+                max_depth_reached = max(max_depth_reached, final_state.current_depth)
+                total_recursive_calls += len(final_state.call_trace)
+
+            return chunk_result
+
     results = await asyncio.gather(*[process_chunk(idx) for idx in chunk_indices])
 
     successful = sum(1 for r in results if "response" in r)
     failed = len(results) - successful
 
-    return _text_response({
+    response = {
         "status": "completed",
         "total_chunks": len(chunk_indices),
         "successful": successful,
         "failed": failed,
         "concurrency": concurrency,
         "results": results,
-    })
+    }
+
+    # Include batch-level recursion stats if recursion was enabled
+    if max_depth > 0:
+        response["recursion"] = {
+            "max_depth": max_depth,
+            "max_depth_reached": max_depth_reached,
+            "total_recursive_calls": total_recursive_calls,
+        }
+
+    return _text_response(response)
 
 
 async def _handle_auto_analyze(arguments: dict) -> list[TextContent]:

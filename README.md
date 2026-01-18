@@ -214,7 +214,34 @@ By default, sub-queries use **Claude Haiku 4.5** via the Claude Agent SDK. This 
 | Provider | Default Model | Cost | Use Case |
 |----------|--------------|------|----------|
 | `claude-sdk` | claude-haiku-4-5 | ~$0.80/1M input | Default, works everywhere |
-| `ollama` | gemma3:27b | $0 | Local inference, requires Ollama |
+| `ollama` | olmo-3.1:32b | $0 | Local inference, requires Ollama |
+
+## Recursive Sub-Queries
+
+The `rlm_sub_query` and `rlm_sub_query_batch` tools support hierarchical decomposition via the `max_depth` parameter:
+
+- `max_depth=0` (default): Flat call, no recursion
+- `max_depth=1-5`: Sub-LLM can use RLM tools (chunk, filter, sub_query, etc.)
+
+Example: Analyzing a massive codebase with 2-level recursion:
+```python
+rlm_sub_query(
+    query="Find all security vulnerabilities",
+    context_name="codebase",
+    chunk_index=0,
+    max_depth=2  # Allow sub-queries to further decompose
+)
+```
+
+**How it works:**
+1. When `max_depth > 0`, the sub-LLM receives RLM tools in its function calling context
+2. If the sub-LLM decides to use a tool (e.g., `rlm_chunk_context`), the agent loop handles it
+3. Each recursive call decrements the depth limit until `max_depth` is reached
+4. The response includes recursion metadata: `depth_reached` and `call_trace`
+
+**Recommended model for recursive calls**: `olmo-3.1:32b` (64K context, strong reasoning)
+
+**Note**: Recursive calls work best with Ollama provider as it supports native tool calling via `/api/chat`. Claude SDK uses simplified handling (`max_turns=1`).
 
 ## Autonomous Usage
 
@@ -269,7 +296,7 @@ If you have [Ollama](https://ollama.ai) installed locally, you can run sub-queri
        query="Summarize this section",
        context_name="my_doc",
        chunk_index=0,
-       provider="ollama"
+       provider="ollama"  # Use local Ollama instead of default claude-sdk
    )
    ```
 
@@ -279,7 +306,7 @@ rlm_sub_query_batch(
     query="Extract key points",
     context_name="my_doc",
     chunk_indices=[0, 1, 2, 3],
-    provider="ollama",
+    provider="ollama",  # Use local Ollama instead of default claude-sdk
     concurrency=4
 )
 ```
@@ -303,8 +330,7 @@ rlm_sub_query_batch(
     query="What is the main topic? Reply in one sentence.",
     context_name="report",
     chunk_indices=[0, 1, 2, 3],
-    provider="ollama",  # or omit for claude-sdk default
-    concurrency=4
+    concurrency=4  # uses claude-sdk by default
 )
 
 # 5. Store results for aggregation
@@ -330,8 +356,7 @@ rlm_sub_query_batch(
     query="What topics does this section cover?",
     context_name="bill",
     chunk_indices=[0, 5, 10, 15, 20, 25, 30, 35],
-    provider="ollama",
-    concurrency=4
+    concurrency=4  # uses claude-sdk by default; add provider="ollama" for free local inference
 )
 ```
 
@@ -470,6 +495,68 @@ Show me where to modify the code.
 How would I add a new provider (e.g., OpenAI)?
 What functions need to change?
 ```
+
+## Test Corpus: Encyclopedia Britannica
+
+The repository includes excerpts from the **Encyclopedia Britannica, 11th Edition** (1910-1911) from Project Gutenberg for testing RLM capabilities on large reference documents.
+
+### Included Files
+
+| File | Size | Description |
+|------|------|-------------|
+| `docs/encyclopedia/merged_encyclopedia.txt` | 11MB | All slices merged (~2M tokens) |
+
+### Using for Testing
+
+```python
+# Load the full encyclopedia
+content = open("docs/encyclopedia/merged_encyclopedia.txt").read()
+rlm_load_context(name="encyclopedia", content=content)
+
+# Inspect
+rlm_inspect_context(name="encyclopedia")
+# → 11MB, 184K lines, ~2M tokens
+
+# Chunk for processing
+rlm_chunk_context(name="encyclopedia", strategy="paragraphs", size=30)
+
+# Query across the corpus
+rlm_sub_query_batch(
+    query="Summarize the main topics in this section",
+    context_name="encyclopedia",
+    chunk_indices=[0, 50, 100, 150],
+    provider="claude-sdk"  # or "ollama" for free local inference
+)
+```
+
+### Example: Extract Topic Catalog
+
+```python
+# Filter for specific subject
+rlm_filter_context(
+    name="encyclopedia",
+    output_name="botany",
+    pattern="(?i)(botan|plant|flora|flower|genus)",
+    mode="keep"
+)
+
+# Analyze filtered content
+rlm_auto_analyze(
+    name="botany_analysis",
+    content=filtered_content,
+    goal="answer:List all botanical articles with brief descriptions"
+)
+```
+
+### Download More Slices
+
+Additional encyclopedia volumes available from Project Gutenberg:
+- Search: https://www.gutenberg.org/ebooks/search/?query=encyclopaedia+britannica+11th
+- ~130 slices available covering A-Z
+
+### Attribution
+
+Encyclopedia Britannica, 11th Edition (1910-1911) sourced from [Project Gutenberg](https://www.gutenberg.org/). Public domain.
 
 ## License
 

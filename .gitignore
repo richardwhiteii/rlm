@@ -53,3 +53,10 @@ tests/fixtures/large_*
 
 # RLM runtime data
 .rlm-data/
+
+# Encyclopedia test corpus - DS_Store only
+docs/encyclopedia/.DS_Store
+
+# Test working files
+docs/working/
+scripts/

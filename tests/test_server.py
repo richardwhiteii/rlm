@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from rlm_mcp_server import (
     _chunk_content,
     _error_response,
+    _get_rlm_tools_for_subcall,
     _handle_chunk_context,
     _handle_filter_context,
     _handle_get_chunk,
@@ -31,6 +32,7 @@ from rlm_mcp_server import (
     _hash_content,
     _text_response,
     contexts,
+    RecursionState,
 )
 
 
@@ -386,7 +388,7 @@ class TestSubQuery:
         await _handle_load_context({"name": "query_test", "content": "test content"})
 
         with patch("rlm_mcp_server._make_provider_call", new_callable=AsyncMock) as mock:
-            mock.return_value = ("mocked response", None)
+            mock.return_value = ("mocked response", None, None)  # result, error, state
 
             result = await _handle_sub_query({
                 "query": "what is this?",
@@ -461,7 +463,7 @@ class TestSubQueryBatch:
         })
 
         with patch("rlm_mcp_server._make_provider_call", new_callable=AsyncMock) as mock:
-            mock.return_value = ("response", None)
+            mock.return_value = ("response", None, None)  # result, error, state
 
             result = await _handle_sub_query_batch({
                 "query": "analyze",
@@ -476,3 +478,75 @@ class TestSubQueryBatch:
             assert parsed["successful"] == 3
             assert parsed["failed"] == 0
             assert mock.call_count == 3
+
+
+class TestRecursionState:
+    """Tests for RecursionState dataclass."""
+
+    def test_can_recurse_when_under_limit(self):
+        """Should allow recursion when current_depth < max_depth."""
+        state = RecursionState(current_depth=1, max_depth=3)
+        assert state.can_recurse() is True
+
+    def test_cannot_recurse_at_limit(self):
+        """Should not allow recursion when current_depth >= max_depth."""
+        state = RecursionState(current_depth=3, max_depth=3)
+        assert state.can_recurse() is False
+
+    def test_descend_increments_depth(self):
+        """Descending should increment depth and record call trace."""
+        state = RecursionState(current_depth=0, max_depth=3)
+        child = state.descend("chunk_0")
+        assert child.current_depth == 1
+        assert child.call_trace == ["chunk_0"]
+        # Original unchanged (immutable pattern)
+        assert state.current_depth == 0
+
+    def test_descend_preserves_max_depth(self):
+        """Child state should preserve max_depth from parent."""
+        state = RecursionState(current_depth=0, max_depth=5)
+        child = state.descend("test")
+        assert child.max_depth == 5
+
+    def test_descend_accumulates_call_trace(self):
+        """Multiple descends should accumulate call trace."""
+        state = RecursionState(current_depth=0, max_depth=5, call_trace=["parent"])
+        child = state.descend("child")
+        assert child.call_trace == ["parent", "child"]
+        assert child.current_depth == 1
+
+
+class TestToolDefinitionGenerator:
+    """Tests for _get_rlm_tools_for_subcall."""
+
+    def test_returns_correct_tools(self):
+        """Should return only tools safe for recursive sub-calls."""
+        tools = _get_rlm_tools_for_subcall()
+        tool_names = {t["function"]["name"] for t in tools}
+        expected = {
+            "rlm_chunk_context",
+            "rlm_get_chunk",
+            "rlm_filter_context",
+            "rlm_sub_query",
+            "rlm_inspect_context",
+            "rlm_list_contexts",
+        }
+        assert tool_names == expected
+
+    def test_openai_compatible_format(self):
+        """Tools should be in OpenAI-compatible function calling format."""
+        tools = _get_rlm_tools_for_subcall()
+        for tool in tools:
+            assert tool["type"] == "function"
+            assert "function" in tool
+            assert "name" in tool["function"]
+            assert "description" in tool["function"]
+            assert "parameters" in tool["function"]
+
+    def test_excludes_dangerous_tools(self):
+        """Should exclude tools that are unsafe for recursive contexts."""
+        tools = _get_rlm_tools_for_subcall()
+        tool_names = {t["function"]["name"] for t in tools}
+        # These should NOT be in recursive sub-calls
+        dangerous_tools = {"rlm_exec", "rlm_auto_analyze", "rlm_load_context"}
+        assert tool_names.isdisjoint(dangerous_tools)
