@@ -8,7 +8,7 @@ This PreToolUse hook intercepts `Read` tool calls and suggests using RLM tools w
 
 ### Behavior
 
-- **Threshold:** 100KB (configurable via `RLM_SIZE_THRESHOLD` env var)
+- **Threshold:** 25KB (configurable via `RLM_SIZE_THRESHOLD` env var)
 - **Action:** Suggests RLM tools but does NOT block the read
 - **Output:** JSON with `decision: "approve"` and optional `reason` message
 
@@ -38,7 +38,7 @@ The hook is configured in `.claude/settings.json`:
 
 #### Manual Testing
 
-1. **Create a large test file (>100KB):**
+1. **Create a large test file (>25KB):**
    ```bash
    python3 -c "print('x' * 150000)" > /tmp/large_file.txt
    ```
@@ -89,7 +89,7 @@ RLM_SIZE_THRESHOLD=1048576 echo '{"tool_input": {"file_path": "somefile.txt"}}' 
 ### Integration Testing with Claude Code
 
 1. Start Claude Code in the RLM project directory
-2. Ask Claude to read a large file (>100KB)
+2. Ask Claude to read a large file (>25KB)
 3. Observe the suggestion message before the file is read
 4. The read will still proceed (not blocked)
 
