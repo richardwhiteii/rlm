@@ -239,9 +239,7 @@ rlm_sub_query(
 3. Each recursive call decrements the depth limit until `max_depth` is reached
 4. The response includes recursion metadata: `depth_reached` and `call_trace`
 
-**Recommended model for recursive calls**: `olmo-3.1:32b` (64K context, strong reasoning)
-
-**Note**: Recursive calls work best with Ollama provider as it supports native tool calling via `/api/chat`. Claude SDK uses simplified handling (`max_turns=1`).
+**Recommended model for recursive calls**: 'gemma3:27b' I'm recommending a local model due to the potential recursive cost escalation. 
 
 ## Autonomous Usage
 
