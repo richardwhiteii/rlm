@@ -41,45 +41,45 @@ pip install -e .
 
 ### Configure for Claude Code
 
-First, find your installation path:
+**Option 1: Quick Setup (recommended)**
+
 ```bash
-cd rlm && pwd
-# Example output: /Users/your_username/projects/rlm
+# From the rlm directory
+claude mcp add rlm -s user -- uv run --directory "$(pwd)" python -m src.rlm_mcp_server
 ```
 
-Add to `~/.claude/.mcp.json`, replacing the example paths with your own:
+This adds RLM globally (`-s user`) so it's available in all your Claude Code sessions.
+
+**Option 2: With Ollama (free local inference)**
+
+First set environment variables, then add:
+```bash
+export RLM_DATA_DIR="$HOME/.rlm-data"
+export OLLAMA_URL="http://localhost:11434"
+
+claude mcp add rlm -s user -- uv run --directory "$(pwd)" python -m src.rlm_mcp_server
+```
+
+**Option 3: Manual JSON config**
+
+Add to `~/.claude/.mcp.json` for full control:
 
 ```json
 {
   "mcpServers": {
     "rlm": {
       "command": "uv",
-      "args": ["run", "--directory", "/Users/your_username/projects/rlm", "python", "-m", "src.rlm_mcp_server"],
+      "args": ["run", "--directory", "/path/to/rlm", "python", "-m", "src.rlm_mcp_server"],
       "env": {
-        "RLM_DATA_DIR": "/Users/your_username/.rlm-data"
+        "RLM_DATA_DIR": "/path/to/.rlm-data",
+        "OLLAMA_URL": "http://localhost:11434"
       }
     }
   }
 }
 ```
 
-> **Note**: Replace `/Users/your_username/projects/rlm` with the output from `pwd` above. The `RLM_DATA_DIR` is where RLM stores contexts and results — you can use any directory you prefer.
-
-**Alternative** (if not using uv):
-```json
-{
-  "mcpServers": {
-    "rlm": {
-      "command": "/Users/your_username/projects/rlm/.venv/bin/python",
-      "args": ["-m", "src.rlm_mcp_server"],
-      "cwd": "/Users/your_username/projects/rlm",
-      "env": {
-        "RLM_DATA_DIR": "/Users/your_username/.rlm-data"
-      }
-    }
-  }
-}
-```
+> **Note**: Replace `/path/to/rlm` with your actual installation path (run `pwd` in the rlm directory).
 
 ## Enable Auto-Detection
 
