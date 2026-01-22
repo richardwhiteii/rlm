@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import regex as regex_lib  # For ReDoS-safe regex with timeout
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -42,6 +44,37 @@ RESULTS_DIR = DATA_DIR / "results"
 
 for directory in [CONTEXTS_DIR, CHUNKS_DIR, RESULTS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
+
+# Security limits
+MAX_CONTEXT_SIZE = 100 * 1024 * 1024  # 100MB per context
+MAX_CONTEXTS = 100  # Maximum number of contexts in memory
+MAX_RESULTS_FILE_SIZE = 10 * 1024 * 1024  # 10MB per results file
+REGEX_TIMEOUT = 5  # Seconds for regex operations
+MIN_TIMEOUT = 1
+MAX_TIMEOUT = 300
+MIN_CHUNK_SIZE = 1
+MAX_CHUNK_SIZE = 100000
+MIN_CONCURRENCY = 1
+MAX_CONCURRENCY = 8
+MIN_MAX_DEPTH = 0
+MAX_MAX_DEPTH = 5
+
+# Context name validation pattern
+CONTEXT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+
+def _validate_context_name(name: str) -> str:
+    """Validate and return context name, or raise ValueError.
+
+    Only allows alphanumeric characters, underscores, and hyphens.
+    This prevents path traversal attacks via context names.
+    """
+    if not CONTEXT_NAME_PATTERN.match(name):
+        raise ValueError(
+            f"Invalid context name: {name}. Use only alphanumeric, underscore, hyphen."
+        )
+    return name
+
 
 # In-memory context storage (also persisted to disk)
 contexts: dict[str, dict] = {}
@@ -82,6 +115,7 @@ def _hash_content(content: str) -> str:
 
 def _load_context_from_disk(name: str) -> Optional[dict]:
     """Load context from disk if it exists."""
+    _validate_context_name(name)  # Prevent path traversal
     meta_path = CONTEXTS_DIR / f"{name}.meta.json"
     content_path = CONTEXTS_DIR / f"{name}.txt"
 
@@ -95,6 +129,7 @@ def _load_context_from_disk(name: str) -> Optional[dict]:
 
 def _save_context_to_disk(name: str, content: str, meta: dict) -> None:
     """Persist context to disk."""
+    _validate_context_name(name)  # Prevent path traversal
     (CONTEXTS_DIR / f"{name}.txt").write_text(content)
     meta_without_content = {k: v for k, v in meta.items() if k != "content"}
     (CONTEXTS_DIR / f"{name}.meta.json").write_text(
@@ -745,6 +780,26 @@ async def _handle_load_context(arguments: dict) -> list[TextContent]:
     ctx_name = arguments["name"]
     content = arguments["content"]
 
+    # Validate context name (path traversal prevention)
+    try:
+        _validate_context_name(ctx_name)
+    except ValueError as e:
+        return _error_response("invalid_context_name", str(e))
+
+    # Check context size limit
+    if len(content) > MAX_CONTEXT_SIZE:
+        return _error_response(
+            "context_too_large",
+            f"Context size {len(content)} bytes exceeds limit of {MAX_CONTEXT_SIZE} bytes"
+        )
+
+    # Check context count limit
+    if ctx_name not in contexts and len(contexts) >= MAX_CONTEXTS:
+        return _error_response(
+            "too_many_contexts",
+            f"Maximum number of contexts ({MAX_CONTEXTS}) reached. Remove some contexts first."
+        )
+
     content_hash = _hash_content(content)
     meta = _context_summary(ctx_name, content, hash=content_hash, chunks=None)
     contexts[ctx_name] = {"meta": meta, "content": content}
@@ -788,6 +843,19 @@ async def _handle_chunk_context(arguments: dict) -> list[TextContent]:
     strategy = arguments.get("strategy", "lines")
     size = arguments.get("size", 100)
 
+    # Validate context name (path traversal prevention)
+    try:
+        _validate_context_name(ctx_name)
+    except ValueError as e:
+        return _error_response("invalid_context_name", str(e))
+
+    # Validate chunk size
+    if not (MIN_CHUNK_SIZE <= size <= MAX_CHUNK_SIZE):
+        return _error_response(
+            "invalid_chunk_size",
+            f"Chunk size must be between {MIN_CHUNK_SIZE} and {MAX_CHUNK_SIZE}"
+        )
+
     error = _ensure_context_loaded(ctx_name)
     if error:
         return _error_response("context_not_found", error)
@@ -822,6 +890,19 @@ async def _handle_get_chunk(arguments: dict) -> list[TextContent]:
     ctx_name = arguments["name"]
     chunk_index = arguments["chunk_index"]
 
+    # Validate context name (path traversal prevention)
+    try:
+        _validate_context_name(ctx_name)
+    except ValueError as e:
+        return _error_response("invalid_context_name", str(e))
+
+    # Validate chunk_index is non-negative
+    if chunk_index < 0:
+        return _error_response(
+            "invalid_chunk_index",
+            f"Chunk index must be >= 0, got {chunk_index}"
+        )
+
     error = _ensure_context_loaded(ctx_name)
     if error:
         return _error_response("context_not_found", error)
@@ -852,18 +933,41 @@ async def _handle_filter_context(arguments: dict) -> list[TextContent]:
     pattern = arguments["pattern"]
     mode = arguments.get("mode", "keep")
 
+    # Validate context names (path traversal prevention)
+    try:
+        _validate_context_name(src_name)
+        _validate_context_name(out_name)
+    except ValueError as e:
+        return _error_response("invalid_context_name", str(e))
+
     error = _ensure_context_loaded(src_name)
     if error:
         return _error_response("context_not_found", error)
 
+    # Use regex library with timeout to prevent ReDoS
+    try:
+        compiled = regex_lib.compile(pattern)
+    except regex_lib.error as e:
+        return _error_response("invalid_regex", f"Invalid regex pattern: {e}")
+
     content = contexts[src_name]["content"]
     lines = content.split("\n")
-    regex = re.compile(pattern)
 
-    if mode == "keep":
-        filtered = [line for line in lines if regex.search(line)]
-    else:
-        filtered = [line for line in lines if not regex.search(line)]
+    # Apply timeout on search operations to prevent ReDoS
+    try:
+        if mode == "keep":
+            filtered = [line for line in lines if compiled.search(line, timeout=REGEX_TIMEOUT)]
+        else:
+            filtered = [line for line in lines if not compiled.search(line, timeout=REGEX_TIMEOUT)]
+    except TimeoutError:
+        return _error_response("regex_timeout", f"Regex matching timed out after {REGEX_TIMEOUT}s")
+
+    # Check context count limit for new context
+    if out_name not in contexts and len(contexts) >= MAX_CONTEXTS:
+        return _error_response(
+            "too_many_contexts",
+            f"Maximum number of contexts ({MAX_CONTEXTS}) reached. Remove some contexts first."
+        )
 
     new_content = "\n".join(filtered)
     meta = _context_summary(
@@ -895,6 +999,20 @@ async def _handle_sub_query(arguments: dict) -> list[TextContent]:
     provider = arguments.get("provider", "claude-sdk")
     model = arguments.get("model") or DEFAULT_MODELS.get(provider, "claude-haiku-4-5-20250514")
     max_depth = arguments.get("max_depth", 0)
+
+    # Validate max_depth bounds
+    if not (MIN_MAX_DEPTH <= max_depth <= MAX_MAX_DEPTH):
+        return _error_response(
+            "invalid_max_depth",
+            f"max_depth must be between {MIN_MAX_DEPTH} and {MAX_MAX_DEPTH}"
+        )
+
+    # Validate chunk_index if provided
+    if chunk_index is not None and chunk_index < 0:
+        return _error_response(
+            "invalid_chunk_index",
+            f"Chunk index must be >= 0, got {chunk_index}"
+        )
 
     error = _ensure_context_loaded(ctx_name)
     if error:
@@ -949,7 +1067,21 @@ async def _handle_store_result(arguments: dict) -> list[TextContent]:
     result = arguments["result"]
     metadata = arguments.get("metadata", {})
 
+    # Validate result name (path traversal prevention)
+    try:
+        _validate_context_name(result_name)
+    except ValueError as e:
+        return _error_response("invalid_result_name", str(e))
+
     results_file = RESULTS_DIR / f"{result_name}.jsonl"
+
+    # Check results file size limit
+    if results_file.exists() and results_file.stat().st_size > MAX_RESULTS_FILE_SIZE:
+        return _error_response(
+            "results_file_too_large",
+            f"Results file exceeds {MAX_RESULTS_FILE_SIZE} bytes. Use rlm_get_results to retrieve and clear."
+        )
+
     with open(results_file, "a") as f:
         f.write(json.dumps({"result": result, "metadata": metadata}) + "\n")
 
@@ -959,6 +1091,13 @@ async def _handle_store_result(arguments: dict) -> list[TextContent]:
 async def _handle_get_results(arguments: dict) -> list[TextContent]:
     """Retrieve stored results for aggregation."""
     result_name = arguments["name"]
+
+    # Validate result name (path traversal prevention)
+    try:
+        _validate_context_name(result_name)
+    except ValueError as e:
+        return _error_response("invalid_result_name", str(e))
+
     results_file = RESULTS_DIR / f"{result_name}.jsonl"
 
     if not results_file.exists():
@@ -1007,8 +1146,30 @@ async def _handle_sub_query_batch(arguments: dict) -> list[TextContent]:
     chunk_indices = arguments["chunk_indices"]
     provider = arguments.get("provider", "claude-sdk")
     model = arguments.get("model") or DEFAULT_MODELS.get(provider, "claude-haiku-4-5-20250514")
-    concurrency = min(arguments.get("concurrency", 4), 8)
+    concurrency = arguments.get("concurrency", 4)
     max_depth = arguments.get("max_depth", 0)
+
+    # Validate concurrency bounds
+    if not (MIN_CONCURRENCY <= concurrency <= MAX_CONCURRENCY):
+        return _error_response(
+            "invalid_concurrency",
+            f"Concurrency must be between {MIN_CONCURRENCY} and {MAX_CONCURRENCY}"
+        )
+
+    # Validate max_depth bounds
+    if not (MIN_MAX_DEPTH <= max_depth <= MAX_MAX_DEPTH):
+        return _error_response(
+            "invalid_max_depth",
+            f"max_depth must be between {MIN_MAX_DEPTH} and {MAX_MAX_DEPTH}"
+        )
+
+    # Validate chunk indices are non-negative
+    negative_indices = [idx for idx in chunk_indices if idx < 0]
+    if negative_indices:
+        return _error_response(
+            "invalid_chunk_indices",
+            f"Chunk indices must be >= 0, got negative: {negative_indices}"
+        )
 
     error = _ensure_context_loaded(ctx_name)
     if error:
@@ -1171,6 +1332,13 @@ async def _handle_exec(arguments: dict) -> list[TextContent]:
     code = arguments["code"]
     ctx_name = arguments["context_name"]
     timeout = arguments.get("timeout", 30)
+
+    # Validate timeout bounds
+    if not (MIN_TIMEOUT <= timeout <= MAX_TIMEOUT):
+        return _error_response(
+            "invalid_timeout",
+            f"Timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds"
+        )
 
     # Ensure context is loaded
     error = _ensure_context_loaded(ctx_name)
