@@ -9,16 +9,26 @@ Treat context as external variable, chunk programmatically, sub-call recursively
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import regex as regex_lib  # For ReDoS-safe regex with timeout
+
+# Configure logging for server-side error tracking
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("rlm-mcp-server")
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -59,8 +69,218 @@ MAX_CONCURRENCY = 8
 MIN_MAX_DEPTH = 0
 MAX_MAX_DEPTH = 5
 
+# H3: Total memory limit across all contexts (1GB)
+MAX_TOTAL_MEMORY = 1 * 1024 * 1024 * 1024
+
+# H4: Total disk quota across all data (5GB)
+MAX_TOTAL_DISK_QUOTA = 5 * 1024 * 1024 * 1024
+
+# H5: Overall operation timeouts (including setup/teardown)
+EXEC_OPERATION_TIMEOUT = 60  # seconds
+FILTER_OPERATION_TIMEOUT = 30  # seconds
+
+# M6: Maximum context size for exec (50MB to limit stdin transfer time)
+MAX_EXEC_CONTEXT_SIZE = 50 * 1024 * 1024
+
+# Lock for thread-safe context operations (M3)
+_context_lock = asyncio.Lock()
+
 # Context name validation pattern
 CONTEXT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+
+class LRUContextStore:
+    """Thread-safe LRU context store with total memory tracking (H3).
+
+    Evicts least-recently-used contexts when total memory limit is approached.
+    """
+
+    def __init__(self, max_total_bytes: int = MAX_TOTAL_MEMORY, max_contexts: int = MAX_CONTEXTS):
+        self._store: OrderedDict[str, dict] = OrderedDict()
+        self._max_total_bytes = max_total_bytes
+        self._max_contexts = max_contexts
+        self._total_bytes = 0
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._store
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def __iter__(self):
+        return iter(self._store)
+
+    def get(self, key: str, default=None):
+        """Get item and move to end (most recently used)."""
+        if key in self._store:
+            self._store.move_to_end(key)
+            return self._store[key]
+        return default
+
+    def __getitem__(self, key: str) -> dict:
+        if key not in self._store:
+            raise KeyError(key)
+        self._store.move_to_end(key)
+        return self._store[key]
+
+    def __setitem__(self, key: str, value: dict) -> None:
+        """Set item, evicting LRU items if needed to stay under memory limit."""
+        content = value.get("content", "")
+        content_size = len(content.encode('utf-8')) if isinstance(content, str) else len(content)
+
+        # If updating existing key, subtract old size first
+        if key in self._store:
+            old_content = self._store[key].get("content", "")
+            old_size = len(old_content.encode('utf-8')) if isinstance(old_content, str) else len(old_content)
+            self._total_bytes -= old_size
+
+        # Evict LRU items until we have room
+        while (self._total_bytes + content_size > self._max_total_bytes or
+               len(self._store) >= self._max_contexts) and len(self._store) > 0:
+            evicted_key, evicted_value = self._store.popitem(last=False)
+            evicted_content = evicted_value.get("content", "")
+            evicted_size = len(evicted_content.encode('utf-8')) if isinstance(evicted_content, str) else len(evicted_content)
+            self._total_bytes -= evicted_size
+            logger.info(f"LRU evicted context '{evicted_key}' ({evicted_size} bytes) to free memory")
+
+        self._store[key] = value
+        self._store.move_to_end(key)
+        self._total_bytes += content_size
+
+    def pop(self, key: str, default=None):
+        """Remove and return item."""
+        if key in self._store:
+            value = self._store.pop(key)
+            content = value.get("content", "")
+            content_size = len(content.encode('utf-8')) if isinstance(content, str) else len(content)
+            self._total_bytes -= content_size
+            return value
+        return default
+
+    def items(self):
+        return self._store.items()
+
+    def keys(self):
+        return self._store.keys()
+
+    @property
+    def total_bytes(self) -> int:
+        """Current total memory usage in bytes."""
+        return self._total_bytes
+
+    @property
+    def available_bytes(self) -> int:
+        """Available memory before limit."""
+        return max(0, self._max_total_bytes - self._total_bytes)
+
+    def clear(self) -> None:
+        """Clear all contexts and reset memory tracking."""
+        self._store.clear()
+        self._total_bytes = 0
+
+
+def _get_disk_usage() -> int:
+    """Calculate total disk usage across all RLM data directories (H4)."""
+    total = 0
+    for directory in [CONTEXTS_DIR, CHUNKS_DIR, RESULTS_DIR]:
+        if directory.exists():
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    try:
+                        total += path.stat().st_size
+                    except OSError:
+                        pass
+    return total
+
+
+def _cleanup_oldest_disk_files(bytes_to_free: int) -> int:
+    """Remove oldest files to free up disk space (H4).
+
+    Returns number of bytes actually freed.
+    """
+    # Collect all files with their modification times
+    files_with_mtime: list[tuple[Path, float, int]] = []
+
+    for directory in [CONTEXTS_DIR, CHUNKS_DIR, RESULTS_DIR]:
+        if directory.exists():
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    try:
+                        stat = path.stat()
+                        files_with_mtime.append((path, stat.st_mtime, stat.st_size))
+                    except OSError:
+                        pass
+
+    # Sort by modification time (oldest first)
+    files_with_mtime.sort(key=lambda x: x[1])
+
+    freed = 0
+    for path, _mtime, size in files_with_mtime:
+        if freed >= bytes_to_free:
+            break
+        try:
+            path.unlink()
+            freed += size
+            logger.info(f"Disk cleanup: removed {path} ({size} bytes)")
+        except OSError as e:
+            logger.warning(f"Failed to remove {path}: {e}")
+
+    return freed
+
+
+def _check_disk_quota(additional_bytes: int = 0) -> tuple[bool, str]:
+    """Check if disk quota would be exceeded (H4).
+
+    Returns (ok, error_message). If not ok, attempts cleanup.
+    """
+    current_usage = _get_disk_usage()
+    projected_usage = current_usage + additional_bytes
+
+    if projected_usage <= MAX_TOTAL_DISK_QUOTA:
+        return True, ""
+
+    # Try to free space
+    bytes_to_free = projected_usage - MAX_TOTAL_DISK_QUOTA + (10 * 1024 * 1024)  # Free extra 10MB buffer
+    freed = _cleanup_oldest_disk_files(bytes_to_free)
+
+    new_usage = _get_disk_usage()
+    if new_usage + additional_bytes <= MAX_TOTAL_DISK_QUOTA:
+        logger.info(f"Disk cleanup freed {freed} bytes, now at {new_usage} bytes")
+        return True, ""
+
+    return False, f"Disk quota exceeded: {new_usage + additional_bytes} bytes > {MAX_TOTAL_DISK_QUOTA} bytes limit"
+
+
+def _safe_mkdir(path: Path) -> tuple[bool, str]:
+    """Safely create a directory, checking for symlink attacks (M6).
+
+    Returns (ok, error_message).
+    """
+    # Check if path already exists as a symlink
+    if path.is_symlink():
+        return False, f"Path is a symlink, refusing to use: {path}"
+
+    # Check parent isn't a symlink pointing outside DATA_DIR
+    try:
+        resolved = path.resolve()
+        data_resolved = DATA_DIR.resolve()
+        if not str(resolved).startswith(str(data_resolved)):
+            return False, f"Path resolves outside data directory: {resolved}"
+    except (OSError, ValueError) as e:
+        return False, f"Failed to resolve path: {e}"
+
+    # Check each parent component
+    current = path
+    while current != DATA_DIR and current != current.parent:
+        if current.is_symlink():
+            return False, f"Parent path contains symlink: {current}"
+        current = current.parent
+
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return True, ""
+    except OSError as e:
+        return False, f"Failed to create directory: {e}"
 
 
 def _validate_context_name(name: str) -> str:
@@ -76,8 +296,8 @@ def _validate_context_name(name: str) -> str:
     return name
 
 
-# In-memory context storage (also persisted to disk)
-contexts: dict[str, dict] = {}
+# In-memory context storage with LRU eviction (H3)
+contexts = LRUContextStore(max_total_bytes=MAX_TOTAL_MEMORY, max_contexts=MAX_CONTEXTS)
 
 server = Server("rlm")
 
@@ -158,8 +378,15 @@ def _text_response(data: Any) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
 
-def _error_response(code: str, message: str) -> list[TextContent]:
-    """Create a structured error response."""
+def _error_response(code: str, message: str, internal_details: str = None) -> list[TextContent]:
+    """Create a structured error response.
+
+    Logs full details server-side (M1) while returning generic message to client.
+    """
+    if internal_details:
+        logger.error(f"Error {code}: {message} | Details: {internal_details}")
+    else:
+        logger.error(f"Error {code}: {message}")
     return _text_response({"error": code, "message": message})
 
 
@@ -787,22 +1014,25 @@ async def _handle_load_context(arguments: dict) -> list[TextContent]:
         return _error_response("invalid_context_name", str(e))
 
     # Check context size limit
-    if len(content) > MAX_CONTEXT_SIZE:
+    content_size = len(content.encode('utf-8')) if isinstance(content, str) else len(content)
+    if content_size > MAX_CONTEXT_SIZE:
         return _error_response(
             "context_too_large",
-            f"Context size {len(content)} bytes exceeds limit of {MAX_CONTEXT_SIZE} bytes"
+            f"Context size {content_size} bytes exceeds limit of {MAX_CONTEXT_SIZE} bytes"
         )
 
-    # Check context count limit
-    if ctx_name not in contexts and len(contexts) >= MAX_CONTEXTS:
-        return _error_response(
-            "too_many_contexts",
-            f"Maximum number of contexts ({MAX_CONTEXTS}) reached. Remove some contexts first."
-        )
+    # Check disk quota before writing (H4)
+    ok, err = _check_disk_quota(content_size * 2)  # Estimate: content + metadata
+    if not ok:
+        return _error_response("disk_quota_exceeded", err)
 
-    content_hash = _hash_content(content)
-    meta = _context_summary(ctx_name, content, hash=content_hash, chunks=None)
-    contexts[ctx_name] = {"meta": meta, "content": content}
+    # Use lock for thread-safe context creation (M3)
+    async with _context_lock:
+        # LRU store handles eviction automatically when setting
+        content_hash = _hash_content(content)
+        meta = _context_summary(ctx_name, content, hash=content_hash, chunks=None)
+        contexts[ctx_name] = {"meta": meta, "content": content}
+
     _save_context_to_disk(ctx_name, content, meta)
 
     return _text_response({
@@ -811,6 +1041,8 @@ async def _handle_load_context(arguments: dict) -> list[TextContent]:
         "length": meta["length"],
         "lines": meta["lines"],
         "hash": content_hash,
+        "memory_used": contexts.total_bytes,
+        "memory_available": contexts.available_bytes,
     })
 
 
@@ -863,6 +1095,12 @@ async def _handle_chunk_context(arguments: dict) -> list[TextContent]:
     content = contexts[ctx_name]["content"]
     chunks = _chunk_content(content, strategy, size)
 
+    # Check disk quota before writing chunks (H4)
+    total_chunk_size = sum(len(c.encode('utf-8')) for c in chunks)
+    ok, err = _check_disk_quota(total_chunk_size)
+    if not ok:
+        return _error_response("disk_quota_exceeded", err)
+
     chunk_meta = [
         {"index": i, "length": len(chunk), "preview": chunk[:100]}
         for i, chunk in enumerate(chunks)
@@ -871,8 +1109,12 @@ async def _handle_chunk_context(arguments: dict) -> list[TextContent]:
     contexts[ctx_name]["meta"]["chunks"] = chunk_meta
     contexts[ctx_name]["chunks"] = chunks
 
+    # Use safe_mkdir to prevent symlink attacks (M6)
     chunk_dir = CHUNKS_DIR / ctx_name
-    chunk_dir.mkdir(exist_ok=True)
+    ok, err = _safe_mkdir(chunk_dir)
+    if not ok:
+        return _error_response("directory_creation_failed", err)
+
     for i, chunk in enumerate(chunks):
         (chunk_dir / f"{i}.txt").write_text(chunk)
 
@@ -928,6 +1170,7 @@ async def _handle_get_chunk(arguments: dict) -> list[TextContent]:
 
 async def _handle_filter_context(arguments: dict) -> list[TextContent]:
     """Filter context using regex."""
+    start_time = time.monotonic()  # Overall operation timeout (M4)
     src_name = arguments["name"]
     out_name = arguments["output_name"]
     pattern = arguments["pattern"]
@@ -954,32 +1197,43 @@ async def _handle_filter_context(arguments: dict) -> list[TextContent]:
     lines = content.split("\n")
 
     # Apply timeout on search operations to prevent ReDoS
+    # Also check overall operation timeout (M4)
     try:
-        if mode == "keep":
-            filtered = [line for line in lines if compiled.search(line, timeout=REGEX_TIMEOUT)]
-        else:
-            filtered = [line for line in lines if not compiled.search(line, timeout=REGEX_TIMEOUT)]
+        filtered = []
+        for i, line in enumerate(lines):
+            # Check overall operation timeout every 1000 lines
+            if i % 1000 == 0:
+                elapsed = time.monotonic() - start_time
+                if elapsed > FILTER_OPERATION_TIMEOUT:
+                    return _error_response(
+                        "operation_timeout",
+                        f"Filter operation timed out after {FILTER_OPERATION_TIMEOUT}s (processed {i}/{len(lines)} lines)"
+                    )
+
+            match = compiled.search(line, timeout=REGEX_TIMEOUT)
+            if mode == "keep":
+                if match:
+                    filtered.append(line)
+            else:
+                if not match:
+                    filtered.append(line)
     except TimeoutError:
         return _error_response("regex_timeout", f"Regex matching timed out after {REGEX_TIMEOUT}s")
 
-    # Check context count limit for new context
-    if out_name not in contexts and len(contexts) >= MAX_CONTEXTS:
-        return _error_response(
-            "too_many_contexts",
-            f"Maximum number of contexts ({MAX_CONTEXTS}) reached. Remove some contexts first."
+    # Use lock for thread-safe context creation (M3)
+    async with _context_lock:
+        new_content = "\n".join(filtered)
+        meta = _context_summary(
+            out_name,
+            new_content,
+            hash=_hash_content(new_content),
+            source=src_name,
+            filter_pattern=pattern,
+            filter_mode=mode,
+            chunks=None,
         )
+        contexts[out_name] = {"meta": meta, "content": new_content}
 
-    new_content = "\n".join(filtered)
-    meta = _context_summary(
-        out_name,
-        new_content,
-        hash=_hash_content(new_content),
-        source=src_name,
-        filter_pattern=pattern,
-        filter_mode=mode,
-        chunks=None,
-    )
-    contexts[out_name] = {"meta": meta, "content": new_content}
     _save_context_to_disk(out_name, new_content, meta)
 
     return _text_response({
@@ -1347,11 +1601,24 @@ async def _handle_exec(arguments: dict) -> list[TextContent]:
 
     content = contexts[ctx_name]["content"]
 
-    # Create a temporary Python file with the execution environment
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-        temp_file = f.name
-        # Write the execution wrapper
-        f.write("""
+    # Check context size limit for exec (H5) - large contexts cause slow stdin transfer
+    content_size = len(content.encode('utf-8')) if isinstance(content, str) else len(content)
+    if content_size > MAX_EXEC_CONTEXT_SIZE:
+        return _error_response(
+            "context_too_large_for_exec",
+            f"Context size {content_size} bytes exceeds exec limit of {MAX_EXEC_CONTEXT_SIZE} bytes. "
+            f"Use rlm_chunk_context first, then exec on individual chunks."
+        )
+
+    # Wrap entire operation with overall timeout (H5)
+    async def _do_exec() -> list[TextContent]:
+        temp_file = None
+        try:
+            # Create a temporary Python file with the execution environment
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+                temp_file = f.name
+                # Write the execution wrapper
+                f.write("""
 import sys
 import json
 import re
@@ -1364,12 +1631,12 @@ context = sys.stdin.read()
 result = None
 try:
 """)
-        # Indent user code
-        for line in code.split("\n"):
-            f.write(f"    {line}\n")
+                # Indent user code
+                for line in code.split("\n"):
+                    f.write(f"    {line}\n")
 
-        # Capture result
-        f.write("""
+                # Capture result
+                f.write("""
     # Output result
     if result is not None:
         print("__RESULT_START__")
@@ -1380,64 +1647,79 @@ except Exception as e:
     sys.exit(1)
 """)
 
+            # Run the subprocess with minimal environment (no shell=True for security)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            }
+
+            # Run subprocess in executor to not block the event loop
+            loop = asyncio.get_event_loop()
+            process = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [sys.executable, temp_file],
+                    input=content,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+            )
+
+            # Parse output
+            stdout = process.stdout
+            stderr = process.stderr
+            return_code = process.returncode
+
+            # Extract result
+            result = None
+            if "__RESULT_START__" in stdout and "__RESULT_END__" in stdout:
+                result_start = stdout.index("__RESULT_START__") + len("__RESULT_START__\n")
+                result_end = stdout.index("__RESULT_END__")
+                result_str = stdout[result_start:result_end].strip()
+                try:
+                    result = json.loads(result_str)
+                except json.JSONDecodeError:
+                    result = result_str
+
+                # Clean stdout
+                stdout = stdout[:stdout.index("__RESULT_START__")].strip()
+
+            return _text_response({
+                "result": result,
+                "stdout": stdout,
+                "stderr": stderr,
+                "return_code": return_code,
+                "timed_out": False,
+            })
+
+        except subprocess.TimeoutExpired:
+            return _text_response({
+                "result": None,
+                "stdout": "",
+                "stderr": f"Execution timed out after {timeout} seconds",
+                "return_code": -1,
+                "timed_out": True,
+            })
+        except Exception as e:
+            logger.error(f"Exec error: {e}", exc_info=True)
+            return _error_response("execution_error", "Code execution failed", str(e))
+        finally:
+            # Clean up temp file
+            if temp_file:
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
+
+    # Apply overall operation timeout (H5)
     try:
-        # Run the subprocess with minimal environment (no shell=True for security)
-        env = {
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        }
-
-        process = subprocess.run(
-            [sys.executable, temp_file],
-            input=content,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
+        return await asyncio.wait_for(_do_exec(), timeout=EXEC_OPERATION_TIMEOUT)
+    except asyncio.TimeoutError:
+        return _error_response(
+            "operation_timeout",
+            f"Exec operation timed out after {EXEC_OPERATION_TIMEOUT}s (including setup)"
         )
-
-        # Parse output
-        stdout = process.stdout
-        stderr = process.stderr
-        return_code = process.returncode
-
-        # Extract result
-        result = None
-        if "__RESULT_START__" in stdout and "__RESULT_END__" in stdout:
-            result_start = stdout.index("__RESULT_START__") + len("__RESULT_START__\n")
-            result_end = stdout.index("__RESULT_END__")
-            result_str = stdout[result_start:result_end].strip()
-            try:
-                result = json.loads(result_str)
-            except json.JSONDecodeError:
-                result = result_str
-
-            # Clean stdout
-            stdout = stdout[:stdout.index("__RESULT_START__")].strip()
-
-        return _text_response({
-            "result": result,
-            "stdout": stdout,
-            "stderr": stderr,
-            "return_code": return_code,
-            "timed_out": False,
-        })
-
-    except subprocess.TimeoutExpired:
-        return _text_response({
-            "result": None,
-            "stdout": "",
-            "stderr": f"Execution timed out after {timeout} seconds",
-            "return_code": -1,
-            "timed_out": True,
-        })
-    except Exception as e:
-        return _error_response("execution_error", str(e))
-    finally:
-        # Clean up temp file
-        try:
-            os.unlink(temp_file)
-        except Exception:
-            pass
 
 
 # Tool dispatch table
